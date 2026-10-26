@@ -14,8 +14,8 @@ CILIUM_POLICY_VERSION = "v2"
 CILIUM_POLICY_PLURAL = "ciliumnetworkpolicies"
 CILIUM_POLICY_KIND = "CiliumNetworkPolicy"
 PUBLIC_NETWORK_REFUSAL = (
-    "internet-enabled Harbor trials on Kubernetes are not supported: this provider refuses "
-    "network_mode='public', and a trial's pod reaches no more than an allowlist names"
+    "network_mode='public' is refused: this environment was configured with "
+    "allow_public_network=false, so a trial's pod reaches no more than an allowlist names"
 )
 _POD_NAMESPACE_LABEL = "io.kubernetes.pod.namespace"
 _CLUSTER_DNS_ENDPOINTS = ("kube-dns", "node-local-dns")
@@ -225,7 +225,7 @@ def build_network_policy_manifest(
                 ),
             }
         case NetworkMode.PUBLIC:
-            raise ValueError(PUBLIC_NETWORK_REFUSAL)
+            raise ValueError("a public trial has no network policy to build")
     metadata: PolicyMetadata = {
         "name": policy_name,
         "namespace": namespace,
