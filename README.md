@@ -11,11 +11,19 @@ running inside a cluster.
 
 ## Install
 
+Install the package into the environment that runs Harbor:
+
 ```bash
-uv add 'harbor-kubernetes @ git+https://github.com/sjawhar/harbor-kubernetes'
+uv tool install harbor --with 'harbor-kubernetes @ git+https://github.com/sjawhar/harbor-kubernetes'
 ```
 
-The package supports Harbor 0.23.x and 0.24.x and Python 3.12 or newer.
+If you manage Harbor as a project dependency, install the `harbor` extra instead:
+
+```bash
+uv add 'harbor-kubernetes[harbor] @ git+https://github.com/sjawhar/harbor-kubernetes'
+```
+
+It is tested with Harbor 0.23.0 and 0.24.0 on Python 3.12 or newer.
 
 ## Job configuration
 
@@ -77,6 +85,30 @@ its own behavior without making this package depend on that host:
 The default pod has no service-account token, disables Kubernetes service-link
 variables, runs the container as root while Harbor switches individual commands to
 the task user, and mounts image volumes read-only.
+
+## Real-cluster end-to-end tests
+
+The real-cluster tests are opt-in and are not part of the unit-test command. They
+run stock `harbor run` from the package virtual environment against the supplied
+kubeconfig context. The context needs permission to create and delete a namespace
+and must serve CiliumNetworkPolicy for the no-network trial.
+
+Each session creates one `harbor-kubernetes-e2e-<random>` namespace, verifies that
+`python:3.13-slim` can pull there before starting Harbor, and deletes the namespace
+in teardown even if a trial fails. It waits for the namespace to be gone. The tests
+do not create resources outside that namespace.
+
+```bash
+uv run pytest tests/e2e -s -vv --e2e --kube-context staging
+uv run --with harbor==0.23.0 pytest tests/e2e -s -vv --e2e --kube-context staging
+```
+
+Both commands run a public task and a no-network task with the Oracle agent. The
+public trial observes no CiliumNetworkPolicy. The no-network trial records its
+policy while it runs, confirms the completed environment setup that includes the
+package's convergence wait, and makes its `tests/test.sh` fail if TCP to the
+package's cluster-DNS address on port 53 remains reachable. The test output prints
+each trial's wall time.
 
 ## Development
 
