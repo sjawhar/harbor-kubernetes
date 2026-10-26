@@ -126,10 +126,11 @@ def _run_harbor(e2e_cluster, tmp_path: Path, *, network_mode: str) -> HarborRun:
                 "tasks": [{"path": str(task_dir)}],
                 "environment": {
                     "import_path": "harbor_kubernetes:KubernetesEnvironment",
+                    # No `cluster_dns_ip`: run from outside the cluster, the environment must
+                    # find the kube-dns Service itself, the path a plain `harbor run` takes.
                     "kwargs": {
                         "namespace": e2e_cluster.namespace,
                         "kube_context": e2e_cluster.kube_context,
-                        "cluster_dns_ip": e2e_cluster.cluster_dns_ip,
                     },
                 },
             }
