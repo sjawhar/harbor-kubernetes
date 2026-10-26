@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from harbor.models.task.config import NetworkMode
+from kubernetes import client as k8s_client
 from test_environment import FakeCluster, _environment
 
 from harbor_kubernetes.environment import KubernetesApis, KubernetesEnvironment
@@ -79,4 +80,42 @@ async def test_missing_cilium_refuses_a_restricted_trial_before_creating_its_pod
     with pytest.raises(RuntimeError, match="Cilium"):
         await environment.start(False)
 
+    assert cluster.pods == {}
+
+
+def _not_found_with_body(body: str) -> k8s_client.ApiException:
+    error = k8s_client.ApiException(status=404, reason="Not Found")
+    error.body = body
+    return error
+
+
+async def test_missing_cilium_crd_body_raises_the_cilium_refusal_before_pod_creation(
+    tmp_path,
+) -> None:
+    error = _not_found_with_body("404 page not found\n")
+    cluster = FakeCluster(cilium_create_error=error)
+    environment = _environment(tmp_path, cluster, baseline=NetworkMode.NO_NETWORK)
+
+    with pytest.raises(RuntimeError, match="Cilium") as refused:
+        await environment.start(False)
+
+    assert refused.value.__cause__ is error
+    assert cluster.pods == {}
+
+
+async def test_missing_namespace_status_body_reraises_the_original_api_exception(
+    tmp_path,
+) -> None:
+    error = _not_found_with_body(
+        '{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",'
+        '"message":"namespaces \\"no-such-ns\\" not found","reason":"NotFound",'
+        '"details":{"name":"no-such-ns","kind":"namespaces"},"code":404}'
+    )
+    cluster = FakeCluster(cilium_create_error=error)
+    environment = _environment(tmp_path, cluster, baseline=NetworkMode.NO_NETWORK)
+
+    with pytest.raises(k8s_client.ApiException) as raised:
+        await environment.start(False)
+
+    assert raised.value is error
     assert cluster.pods == {}

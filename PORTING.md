@@ -67,11 +67,12 @@ at `415274e0e0e`. Each source test is classified exactly once.
 ## Assertion-preservation comparison
 
 Manual check-by-check comparison: **30 PORTED source tests → 30 direct package
-test functions** in `tests/test_source_parity.py`. Every non-fixture `assert` and
-`pytest.raises` fact has a same-fact package assertion after the five agreed changes.
-The generic cases added beside the one-to-one ports cover failed pod deletion, deleted-pod
-downloads, supplied/omitted caller annotations, both public/restricted transitions, strict
-public-mode refusal, and DNS refusal before a pod is created.
+test functions** in `tests/test_source_parity.py`. Six extra package tests cover generic
+behavior not isolated by a source test; parametrization produces **38 executed parity-test
+instances**. Every non-fixture `assert` and `pytest.raises` fact has a same-fact package
+assertion after the five agreed changes. The generic cases cover failed pod deletion,
+deleted-pod downloads, supplied/omitted caller annotations, both public/restricted
+transitions, strict public-mode refusal, and DNS refusal before a pod is created.
 
 ## Fixture-bound source checks excluded from the package
 
@@ -102,3 +103,9 @@ propagated Kubernetes `ApiException(404)`. The output ended with `4 failed`.
 After the changes, the same command reported `4 passed`. The tests cover public runs without
 a Cilium policy, the restrictive override, `kube-system/kube-dns` and `cluster_dns_ip` lookup,
 and a Cilium-404 refusal before pod creation.
+
+The Cilium 404 classification tests were also red then green. Before the body parser,
+`test_missing_namespace_status_body_reraises_the_original_api_exception` failed because the
+package turned Kubernetes' JSON namespace Status into a Cilium refusal (`1 failed, 5 passed`).
+Afterward, the six-test file passed. It uses the real-server bodies: `404 page not found\n` for
+an absent CRD and a Kubernetes Status whose `details.kind` is `namespaces` for an absent namespace.

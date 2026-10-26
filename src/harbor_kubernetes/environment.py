@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import re
@@ -86,6 +87,20 @@ POD_START_FAILURES = frozenset(
         "CreateContainerError",
     }
 )
+
+
+def _is_namespace_not_found(error: k8s_client.ApiException) -> bool:
+    """Whether a 404 body is Kubernetes' JSON Status for a missing namespace."""
+    if error.status != 404 or not isinstance(error.body, str):
+        return False
+    try:
+        document: object = json.loads(error.body)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(document, dict) or document.get("kind") != "Status":
+        return False
+    details = document.get("details")
+    return isinstance(details, dict) and details.get("kind") == "namespaces"
 
 
 class KubernetesEnvironmentKwargs(TypedDict, total=False):
@@ -606,7 +621,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 body=desired,
             )
         except k8s_client.ApiException as error:
-            if error.status == 404:
+            if error.status == 404 and not _is_namespace_not_found(error):
                 raise RuntimeError(
                     f"{CILIUM_POLICY_KIND} is unavailable: restricted Harbor trials "
                     + "require Cilium on the target cluster."

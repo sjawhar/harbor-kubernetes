@@ -121,7 +121,11 @@ class FakeCluster:
     """The pod, Cilium custom-resource, service, and exec surfaces a trial uses."""
 
     def __init__(
-        self, *, egress_closes_after: int = 0, waiting_reason: str | None = None
+        self,
+        *,
+        egress_closes_after: int = 0,
+        waiting_reason: str | None = None,
+        cilium_create_error: k8s_client.ApiException | None = None,
     ) -> None:
         self.pods: dict[str, k8s_client.V1Pod] = {}
         self.policies: dict[str, CiliumNetworkPolicyManifest] = {}
@@ -132,6 +136,7 @@ class FakeCluster:
         self.probes = 0
         self.waiting_reason = waiting_reason
         self.cilium_enabled = True
+        self.cilium_create_error = cilium_create_error
         self.service_dns_ip: str | None = "10.96.0.10"
 
     def create_namespaced_pod(
@@ -216,6 +221,8 @@ class FakeCluster:
         plural: str,
         body: CiliumNetworkPolicyManifest,
     ) -> object:
+        if self.cilium_create_error is not None:
+            raise self.cilium_create_error
         self._require_cilium(group, version, plural)
         metadata = body["metadata"]
         assert metadata["namespace"] == namespace
