@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Protocol, Required, TypedDict, Unpack, override
+from typing import Protocol, Required, TypedDict, Unpack, cast, override
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.capabilities import (
@@ -131,9 +131,9 @@ class PodApi(Protocol):
 
     def create_namespaced_pod(
         self, namespace: str, body: k8s_client.V1Pod
-    ) -> object: ...
+    ) -> k8s_client.V1Pod: ...
 
-    def read_namespaced_pod(self, name: str, namespace: str) -> object: ...
+    def read_namespaced_pod(self, name: str, namespace: str) -> k8s_client.V1Pod: ...
 
     def delete_namespaced_pod(
         self,
@@ -143,7 +143,9 @@ class PodApi(Protocol):
         body: k8s_client.V1DeleteOptions | None = None,
     ) -> object: ...
 
-    def read_namespaced_service(self, name: str, namespace: str) -> object: ...
+    def read_namespaced_service(
+        self, name: str, namespace: str
+    ) -> k8s_client.V1Service: ...
 
 
 class CiliumPolicyApi(Protocol):
@@ -385,8 +387,10 @@ class KubernetesEnvironment(BaseEnvironment):
             )
 
         return KubernetesApis(
-            pods=k8s_client.CoreV1Api(rest_client),
-            cilium_policies=k8s_client.CustomObjectsApi(rest_client),
+            pods=cast(PodApi, k8s_client.CoreV1Api(rest_client)),
+            cilium_policies=cast(
+                CiliumPolicyApi, k8s_client.CustomObjectsApi(rest_client)
+            ),
             open_exec=open_exec,
         )
 
@@ -651,32 +655,20 @@ class KubernetesEnvironment(BaseEnvironment):
         apis = await self._apis()
         pod = self.pod_manifest()
         try:
-            created_result = await asyncio.to_thread(
+            created = await asyncio.to_thread(
                 apis.pods.create_namespaced_pod, namespace=self.namespace, body=pod
             )
-            if not isinstance(created_result, k8s_client.V1Pod):
-                raise RuntimeError(
-                    "Kubernetes returned a non-Pod when creating a trial pod"
-                )
-            created = created_result
         except k8s_client.ApiException as error:
             if error.status != 409:
                 raise
-            existing_result = await asyncio.to_thread(
+            existing = await asyncio.to_thread(
                 apis.pods.read_namespaced_pod,
                 name=self.pod_name,
                 namespace=self.namespace,
             )
-            if not isinstance(existing_result, k8s_client.V1Pod):
-                raise RuntimeError(
-                    "Kubernetes returned a non-Pod for an existing trial pod"
-                )
-            existing = existing_result
             owner = (
-                None
-                if existing.metadata is None
-                else (existing.metadata.annotations or {}).get(SESSION_ID_ANNOTATION)
-            )
+                cast(k8s_client.V1ObjectMeta, existing.metadata).annotations or {}
+            ).get(SESSION_ID_ANNOTATION)
             if owner != self.session_id:
                 raise RuntimeError(
                     f"Pod {self.pod_name} already exists for Harbor session {owner!r}, "
@@ -692,16 +684,10 @@ class KubernetesEnvironment(BaseEnvironment):
                 ),
             )
             await self._wait_for_pod_gone()
-            created_result = await asyncio.to_thread(
+            created = await asyncio.to_thread(
                 apis.pods.create_namespaced_pod, namespace=self.namespace, body=pod
             )
-            if not isinstance(created_result, k8s_client.V1Pod):
-                raise RuntimeError(
-                    "Kubernetes returned a non-Pod when recreating a trial pod"
-                )
-            created = created_result
-        metadata = created.metadata
-        uid = None if metadata is None else metadata.uid
+        uid = cast(k8s_client.V1ObjectMeta, created.metadata).uid
         if not uid:
             raise RuntimeError(
                 f"The API server created pod {self.pod_name} but returned no uid for it, "
@@ -717,14 +703,11 @@ class KubernetesEnvironment(BaseEnvironment):
     async def _read_pod(self) -> k8s_client.V1Pod | None:
         apis = await self._apis()
         try:
-            pod = await asyncio.to_thread(
+            return await asyncio.to_thread(
                 apis.pods.read_namespaced_pod,
                 name=self.pod_name,
                 namespace=self.namespace,
             )
-            if not isinstance(pod, k8s_client.V1Pod):
-                raise RuntimeError("Kubernetes returned a non-Pod for a trial pod")
-            return pod
         except k8s_client.ApiException as error:
             if error.status == 404:
                 return None
@@ -745,8 +728,8 @@ class KubernetesEnvironment(BaseEnvironment):
         deadline = time.monotonic() + self.pod_ready_timeout_sec
         while True:
             pod = await self._read_pod()
-            if pod is not None and pod.status is not None:
-                status = pod.status
+            if pod is not None:
+                status = cast(k8s_client.V1PodStatus, pod.status)
                 container_statuses = status.container_statuses or []
                 if (
                     status.phase == "Running"
