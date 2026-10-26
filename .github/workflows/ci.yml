@@ -23,7 +23,13 @@ jobs:
         run: |
           uv sync --group dev
           uv pip install "harbor==${{ matrix.harbor }}"
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run basedpyright
-      - run: uv run pytest -n 4 -q
+      # --no-sync: a syncing `uv run` would reinstall the locked Harbor over the matrix's.
+      - name: Harbor under test
+        run: |
+          installed=$(uv run --no-sync python -c 'import importlib.metadata as m; print(m.version("harbor"))')
+          echo "harbor $installed"
+          test "$installed" = "${{ matrix.harbor }}"
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+      - run: uv run --no-sync basedpyright
+      - run: uv run --no-sync pytest -n 4 -q

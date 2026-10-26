@@ -16,10 +16,18 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+# Harbor is not a hard dependency: the package is only ever loaded by a process that already
+# runs Harbor (`harbor run`, or a host that runs Harbor in-process), and Harbor's litellm caps
+# openai<3, which a hard dependency would force on every environment that installs this
+# package. Install it beside Harbor, or take the `harbor` extra.
 dependencies = [
-    "harbor>=0.23.0,<0.25",
     "kubernetes>=29.0.0,<36",
     "pydantic>=2.12.0",
+]
+
+[project.optional-dependencies]
+harbor = [
+    "harbor>=0.23.0,<0.25",
 ]
 
 [project.urls]
@@ -36,6 +44,7 @@ packages = ["src/harbor_kubernetes"]
 [dependency-groups]
 dev = [
     "basedpyright",
+    "harbor>=0.23.0,<0.25",
     "pytest",
     "pytest-asyncio",
     "pytest-xdist>=3.8.0",
