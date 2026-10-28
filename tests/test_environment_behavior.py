@@ -13,16 +13,16 @@ import pytest
 from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor.models.trial.config import ServiceVolumeConfig
 from kubernetes import client as k8s_client
-from test_environment import (
-    _IMAGE,
-    _NAMESPACE,
-    _POD,
-    _POD_UID,
-    _POLICY,
-    _SESSION,
+from harbor_kubernetes.testing import (
+    IMAGE as _IMAGE,
+    NAMESPACE as _NAMESPACE,
+    POD as _POD,
+    POD_UID as _POD_UID,
+    POLICY as _POLICY,
+    SESSION as _SESSION,
     FakeCluster,
-    _environment,
-    _policy,
+    fake_environment,
+    network_policy as _policy,
 )
 
 from harbor_kubernetes.environment import KubernetesEnvironment, KubernetesPodGoneError
@@ -31,6 +31,42 @@ from harbor_kubernetes.network_policy import (
     SESSION_ID_ANNOTATION,
     SESSION_LABEL,
 )
+
+
+def _environment(
+    tmp_path: Path,
+    cluster: FakeCluster,
+    *,
+    baseline: NetworkMode = NetworkMode.ALLOWLIST,
+    phase: NetworkMode = NetworkMode.NO_NETWORK,
+    pod_labels: dict[str, str] | None = None,
+    runtime_class_name: str | None = None,
+    annotations: dict[str, str] | None = None,
+    docker_image: str | None = _IMAGE,
+    workdir: Path | None = None,
+    mounts: list[ServiceVolumeConfig] | None = None,
+    ephemeral_storage_request: str | None = None,
+    ephemeral_storage_limit: str | None = None,
+    allow_public_network: bool = True,
+    cluster_dns_ip: str | None = None,
+) -> KubernetesEnvironment:
+    return fake_environment(
+        KubernetesEnvironment,
+        tmp_path,
+        cluster,
+        baseline=baseline,
+        phase=phase,
+        pod_labels=pod_labels,
+        runtime_class_name=runtime_class_name,
+        annotations=annotations,
+        docker_image=docker_image,
+        workdir=workdir,
+        mounts=mounts,
+        ephemeral_storage_request=ephemeral_storage_request,
+        ephemeral_storage_limit=ephemeral_storage_limit,
+        allow_public_network=allow_public_network,
+        cluster_dns_ip=cluster_dns_ip,
+    )
 
 
 async def test_start_boots_one_root_pod_carrying_the_labels_and_runtime_class(
@@ -79,6 +115,7 @@ async def test_start_boots_one_root_pod_carrying_the_labels_and_runtime_class(
     assert metadata.labels == {"sandbox-pool": "generic", SESSION_LABEL: _POD}
     assert spec.runtime_class_name == "gvisor"
     assert spec.automount_service_account_token is False
+    assert spec.enable_service_links is False
     assert spec.restart_policy == "Never"
     assert spec.dns_policy == "None"
     assert spec.dns_config is not None
@@ -198,6 +235,39 @@ def test_an_image_mount_is_the_pods_read_only_image_volume(tmp_path: Path) -> No
     )
 
 
+def test_an_environment_subclass_can_rewrite_an_image_mount_reference(
+    tmp_path: Path,
+) -> None:
+    class RewritingEnvironment(KubernetesEnvironment):
+        @override
+        def resolve_image_mount_reference(self, reference: str) -> str:
+            return f"mirror.example/{reference}"
+
+    environment = fake_environment(
+        RewritingEnvironment,
+        tmp_path,
+        FakeCluster(),
+        mounts=[
+            ServiceVolumeConfig(
+                type="image",
+                source="registry.example/cli:1",
+                target="/opt/cli",
+                read_only=True,
+            )
+        ],
+    )
+
+    pod = environment.pod_manifest()
+    assert pod.spec is not None
+    assert pod.spec.volumes is not None
+    [volume] = pod.spec.volumes
+    assert volume.image is not None
+    assert volume.image.reference == "mirror.example/registry.example/cli:1"
+    [container] = pod.spec.containers
+    assert container.volume_mounts is not None
+    assert container.volume_mounts[0].read_only is True
+
+
 async def test_a_no_network_baseline_is_in_force_before_the_pod_exists(
     tmp_path: Path,
 ) -> None:
@@ -305,10 +375,6 @@ async def test_switching_to_public_deletes_the_restricted_policy_and_leaves_the_
     assert environment.network_policy.network_mode == NetworkMode.PUBLIC
 
 
-def test_the_trial_pod_links_no_service_into_its_environment(tmp_path: Path) -> None:
-    pod = _environment(tmp_path, FakeCluster()).pod_manifest()
-    assert pod.spec is not None
-    assert pod.spec.enable_service_links is False
 
 
 async def test_a_policy_another_writer_updated_is_still_replaced_in_place(
@@ -869,4 +935,125 @@ async def test_missing_dns_target_refuses_before_creating_the_pod(
         await environment.start(False)
 
     assert ("create_pod", _POD) not in cluster.calls
+    assert cluster.pods == {}
+
+
+async def test_public_network_is_allowed_without_creating_a_cilium_policy(
+    tmp_path: Path,
+) -> None:
+    """A plain Harbor public task does not require Cilium."""
+    cluster = FakeCluster()
+    environment = _environment(
+        tmp_path,
+        cluster,
+        baseline=NetworkMode.PUBLIC,
+        phase=NetworkMode.PUBLIC,
+    )
+
+    await environment.start(False)
+
+    assert cluster.calls == [("create_pod", environment.pod_name)]
+    assert cluster.policies == {}
+
+
+async def test_a_public_trial_starts_where_cilium_requests_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A public trial sends no Cilium request, so a role without Cilium rights runs it."""
+    cluster = FakeCluster()
+    cilium_requests: list[str] = []
+
+    def refuse(**kwargs: object) -> object:
+        cilium_requests.append(str(kwargs.get("name", kwargs.get("plural"))))
+        raise k8s_client.ApiException(status=403, reason="Forbidden")
+
+    for method in (
+        "create_namespaced_custom_object",
+        "get_namespaced_custom_object",
+        "patch_namespaced_custom_object",
+        "replace_namespaced_custom_object",
+        "delete_namespaced_custom_object",
+    ):
+        monkeypatch.setattr(cluster, method, refuse)
+    environment = _environment(
+        tmp_path,
+        cluster,
+        baseline=NetworkMode.PUBLIC,
+        phase=NetworkMode.PUBLIC,
+    )
+
+    await environment.start(False)
+    await environment.stop(delete=True)
+
+    assert cilium_requests == []
+    assert ("create_pod", environment.pod_name) in cluster.calls
+
+
+def test_off_cluster_dns_target_uses_kube_dns_service_or_an_explicit_override(
+    tmp_path: Path,
+) -> None:
+    """No-network convergence finds a cluster address without reading a laptop resolver."""
+    cluster = FakeCluster()
+    environment = _environment(tmp_path, cluster)
+
+    assert KubernetesEnvironment.cluster_dns_probe_target(environment) == "10.96.0.10"
+
+    override = _environment(tmp_path / "override", cluster, cluster_dns_ip="10.0.0.53")
+    assert KubernetesEnvironment.cluster_dns_probe_target(override) == "10.0.0.53"
+
+    cluster.service_dns_ip = None
+    unavailable = _environment(tmp_path / "missing", cluster)
+    with pytest.raises(RuntimeError, match="cluster_dns_ip"):
+        KubernetesEnvironment.cluster_dns_probe_target(unavailable)
+
+
+async def test_missing_cilium_refuses_a_restricted_trial_before_creating_its_pod(
+    tmp_path: Path,
+) -> None:
+    """A missing Cilium CRD has an actionable error and never launches the trial."""
+    cluster = FakeCluster()
+    cluster.cilium_enabled = False
+    environment = _environment(tmp_path, cluster, baseline=NetworkMode.NO_NETWORK)
+
+    with pytest.raises(RuntimeError, match="Cilium"):
+        await environment.start(False)
+
+    assert cluster.pods == {}
+
+
+def _not_found_with_body(body: str) -> k8s_client.ApiException:
+    error = k8s_client.ApiException(status=404, reason="Not Found")
+    error.body = body
+    return error
+
+
+async def test_missing_cilium_crd_body_raises_the_cilium_refusal_before_pod_creation(
+    tmp_path: Path,
+) -> None:
+    error = _not_found_with_body("404 page not found\n")
+    cluster = FakeCluster(cilium_create_error=error)
+    environment = _environment(tmp_path, cluster, baseline=NetworkMode.NO_NETWORK)
+
+    with pytest.raises(RuntimeError, match="Cilium") as refused:
+        await environment.start(False)
+
+    assert refused.value.__cause__ is error
+    assert cluster.pods == {}
+
+
+async def test_missing_namespace_status_body_reraises_the_original_api_exception(
+    tmp_path: Path,
+) -> None:
+    error = _not_found_with_body(
+        '{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",'
+        '"message":"namespaces \\"no-such-ns\\" not found","reason":"NotFound",'
+        '"details":{"name":"no-such-ns","kind":"namespaces"},"code":404}'
+    )
+    cluster = FakeCluster(cilium_create_error=error)
+    environment = _environment(tmp_path, cluster, baseline=NetworkMode.NO_NETWORK)
+
+    with pytest.raises(k8s_client.ApiException) as raised:
+        await environment.start(False)
+
+    assert raised.value is error
     assert cluster.pods == {}

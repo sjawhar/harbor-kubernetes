@@ -143,6 +143,8 @@ class KubernetesEnvironmentInitKwargs(
 ):
     """Every keyword ``KubernetesEnvironment.__init__`` accepts after Harbor's positionals."""
 
+    apis: KubernetesApis | None
+
 
 class KubernetesPodGoneError(RuntimeError):
     """Raised when the trial's pod no longer exists."""
@@ -290,6 +292,7 @@ class KubernetesEnvironment(BaseEnvironment):
         ephemeral_storage_limit: str | None = None,
         allow_public_network: bool = True,
         cluster_dns_ip: str | None = None,
+        apis: KubernetesApis | None = None,
         **kwargs: Unpack[KubernetesEnvironmentInitKwargs],
     ) -> None:
         if not namespace:
@@ -308,7 +311,7 @@ class KubernetesEnvironment(BaseEnvironment):
         self.pod_name = _k8s_name(session_id)
         self.network_policy_name = f"{self.pod_name}-sandbox-egress"
         self._apis_lock = asyncio.Lock()
-        self._connected_apis: KubernetesApis | None = None
+        self._connected_apis: KubernetesApis | None = apis
         self._pod_started = False
         self._pod_owner: OwnerReference | None = None
         self._policy_created = False
