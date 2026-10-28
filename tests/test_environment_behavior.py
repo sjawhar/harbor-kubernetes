@@ -1,4 +1,4 @@
-"""One-to-one unit-test ports for generic Kubernetes environment behavior."""
+"""The Kubernetes environment's pod lifecycle, exec and transfer, and network-policy behavior."""
 
 from __future__ import annotations
 

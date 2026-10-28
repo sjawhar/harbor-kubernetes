@@ -1,9 +1,9 @@
 # harbor-kubernetes
 
 `harbor-kubernetes` is a public [Harbor](https://github.com/harbor-framework/harbor)
-environment extension. It runs each Harbor trial as one plain Kubernetes pod from the
-task's prebuilt image. Harbor commands and file transfers use Kubernetes exec; a task
-cannot select Docker Compose or trigger an image build.
+environment extension. It runs each Harbor trial as one Kubernetes pod from the task's
+`[environment].docker_image`, and carries Harbor's commands and file transfers over
+Kubernetes exec.
 
 The package has no dependency on a particular Harbor host. It works with a normal
 `harbor run` from a machine that has Kubernetes credentials, as well as from a service
@@ -35,7 +35,7 @@ Configure the environment at the Harbor job level:
     "import_path": "harbor_kubernetes:KubernetesEnvironment",
     "kwargs": {
       "namespace": "harbor-trials",
-      "kube_context": "kind-harbor",
+      "kube_context": "my-cluster",
       "runtime_class_name": "gvisor",
       "pod_labels": {"app.kubernetes.io/part-of": "harbor"},
       "annotations": {"example.com/owner": "evaluation-team"},
