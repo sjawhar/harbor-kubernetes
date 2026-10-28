@@ -63,6 +63,7 @@ class CiliumPolicyObserver:
         )
         self._names: set[str] = set()
         self._error: Exception | None = None
+        self._ended_before_stop: bool = False
 
     def start(self) -> None:
         """Begin watching after the initial list's resource version is established."""
@@ -84,9 +85,20 @@ class CiliumPolicyObserver:
             raise RuntimeError("Cilium policy observer did not stop")
         if self._error is not None:
             raise self._error
+        if self._ended_before_stop:
+            raise RuntimeError(
+                "Cilium policy watch ended before the run finished, "
+                + "so its record of added policies is incomplete"
+            )
         return frozenset(self._names)
 
     def _watch_policies(self) -> None:
+        try:
+            self._watch_until_stopped()
+        finally:
+            self._ended_before_stop = not self._stop.is_set()
+
+    def _watch_until_stopped(self) -> None:
         try:
             resource_version = _resource_version(
                 _policy_list(self._custom_objects_api, self._namespace)
@@ -107,7 +119,7 @@ class CiliumPolicyObserver:
                 name = _policy_name(event.get("object"))
                 if name is not None:
                     self._names.add(name)
-        except Exception as error:
+        except (k8s_client.ApiException, RuntimeError) as error:
             self._error = error
             self._ready.set()
 
@@ -321,8 +333,6 @@ def _no_network_healthcheck(cluster_dns_ip: str) -> str:
         )
         + " && exit 1 || exit 0"
     )
-
-
 
 
 def _list_policy_names(e2e_cluster: E2ECluster) -> frozenset[str]:

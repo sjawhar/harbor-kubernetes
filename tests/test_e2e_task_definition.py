@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Iterator
-from typing import override
 from pathlib import Path
+from typing import override
 
+import pytest
 from e2e import test_harbor_run
 from e2e.test_harbor_run import write_task
 from kubernetes import client as k8s_client
@@ -51,9 +53,12 @@ def test_policy_observer_watches_from_the_initial_list_resource_version() -> Non
             return {"metadata": {"resourceVersion": "42"}, "items": []}
 
     class RecordingWatch(k8s_watch.Watch):
+        """Yields one ADDED event, then blocks until stopped, as a real watch does."""
+
         def __init__(self) -> None:
             super().__init__()
             self.calls: list[dict[str, object]] = []
+            self._stopped: threading.Event = threading.Event()
 
         @override
         def stream(
@@ -68,10 +73,11 @@ def test_policy_observer_watches_from_the_initial_list_resource_version() -> Non
                 "type": "ADDED",
                 "object": {"metadata": {"name": "created-after-watch"}},
             }
+            _ = self._stopped.wait(5)
 
         @override
         def stop(self) -> None:
-            return None
+            self._stopped.set()
 
     api = RecordingApi()
     watch = RecordingWatch()
@@ -97,3 +103,42 @@ def test_policy_observer_watches_from_the_initial_list_resource_version() -> Non
             "resource_version": "42",
         }
     ]
+
+
+def test_a_policy_watch_that_ends_before_stop_fails_the_observation() -> None:
+    class ListingApi(k8s_client.CustomObjectsApi):
+        @override
+        def list_namespaced_custom_object(
+            self,
+            group: str,
+            version: str,
+            namespace: str,
+            plural: str,
+        ) -> dict[str, object]:
+            del group, version, namespace, plural
+            return {"metadata": {"resourceVersion": "42"}, "items": []}
+
+    class EndingWatch(k8s_watch.Watch):
+        """A watch stream that ends on its own, before the run stops it."""
+
+        @override
+        def stream(
+            self,
+            func: Callable[..., dict[str, object]],
+            *args: object,
+            **kwargs: object,
+        ) -> Iterator[dict[str, object]]:
+            del func, args, kwargs
+            yield from ()
+
+        @override
+        def stop(self) -> None:
+            return None
+
+    observer = test_harbor_run.CiliumPolicyObserver(
+        ListingApi(), "scratch", EndingWatch()
+    )
+    observer.start()
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        _ = observer.stop()
