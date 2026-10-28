@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from ipaddress import ip_address, ip_network
 from typing import NotRequired, Required, TypedDict
 
@@ -19,7 +20,7 @@ PUBLIC_NETWORK_REFUSAL = (
 )
 _POD_NAMESPACE_LABEL = "io.kubernetes.pod.namespace"
 _CLUSTER_DNS_ENDPOINTS = ("kube-dns", "node-local-dns")
-_DNS_PORT = "53"
+DNS_PORT = "53"
 
 
 class Selector(TypedDict):
@@ -131,7 +132,7 @@ class CiliumPolicyOwnerPatch(TypedDict):
     metadata: _OwnerPatchMetadata
 
 
-def validated_pod_labels(pod_labels: dict[str, str] | None) -> dict[str, str]:
+def validated_pod_labels(pod_labels: Mapping[str, str] | None) -> dict[str, str]:
     """Copy caller labels while reserving the provider's pod identity label."""
     labels = dict(pod_labels or {})
     if SESSION_LABEL in labels:
@@ -169,7 +170,7 @@ def _sandbox_egress_rules(
             ],
             "toPorts": [
                 {
-                    "ports": [{"port": _DNS_PORT, "protocol": "ANY"}],
+                    "ports": [{"port": DNS_PORT, "protocol": "ANY"}],
                     "rules": {"dns": patterns},
                 }
             ],

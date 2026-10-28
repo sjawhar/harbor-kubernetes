@@ -6,25 +6,25 @@ import io
 import tarfile
 import time
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
 
-_MISSING_PATH_EXIT = 44
-_DIRECTORY_PATH_EXIT = 45
-_TIMEOUT_EXIT_CODE = 124
-_TIMEOUT_KILL_AFTER_SEC = 10
-_EXEC_KEEPALIVE_SEC = 30.0
+MISSING_PATH_EXIT: Final = 44
+DIRECTORY_PATH_EXIT: Final = 45
+TIMEOUT_EXIT_CODE: Final = 124
+TIMEOUT_KILL_AFTER_SEC: Final = 10
+_EXEC_KEEPALIVE_SEC: Final = 30.0
 
 UPLOAD_FILE_SCRIPT = (
     'umask 022 && mkdir -p "$(dirname "$2")" && head -c "$1" > "$2" && chmod "$3" "$2"'
 )
 UPLOAD_DIR_SCRIPT = 'umask 022 && mkdir -p "$2" && head -c "$1" | tar -xf - -C "$2"'
 DOWNLOAD_FILE_SCRIPT = (
-    f'[ -e "$1" ] || exit {_MISSING_PATH_EXIT}; '
-    + f'[ -d "$1" ] && exit {_DIRECTORY_PATH_EXIT}; '
+    f'[ -e "$1" ] || exit {MISSING_PATH_EXIT}; '
+    + f'[ -d "$1" ] && exit {DIRECTORY_PATH_EXIT}; '
     + 'exec cat -- "$1"'
 )
 DOWNLOAD_DIR_SCRIPT = (
-    f'[ -d "$1" ] || exit {_MISSING_PATH_EXIT}; cd "$1" && exec tar -cf - .'
+    f'[ -d "$1" ] || exit {MISSING_PATH_EXIT}; cd "$1" && exec tar -cf - .'
 )
 
 

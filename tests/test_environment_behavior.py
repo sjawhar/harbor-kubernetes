@@ -182,6 +182,33 @@ async def test_a_policy_left_by_an_earlier_attempt_is_replaced_and_deleted_at_st
     assert cluster.policies == {}
 
 
+async def test_a_malformed_live_policy_resource_version_is_refused(
+    tmp_path: Path,
+) -> None:
+    class MalformedPolicyCluster(FakeCluster):
+        @override
+        def get_namespaced_custom_object(
+            self,
+            group: str,
+            version: str,
+            namespace: str,
+            plural: str,
+            name: str,
+        ) -> object:
+            del group, version, namespace, plural, name
+            return {"metadata": {}}
+
+    cluster = MalformedPolicyCluster()
+    environment = _environment(tmp_path, cluster)
+    leftover = environment.network_policy_manifest(environment.network_policy)
+    assert leftover is not None
+    cluster.policies[_POLICY] = leftover
+    cluster.resource_versions[_POLICY] = 4
+
+    with pytest.raises(RuntimeError, match="metadata.resourceVersion"):
+        await environment.start(False)
+
+
 async def test_a_pod_another_session_folds_onto_is_never_deleted(
     tmp_path: Path,
 ) -> None:

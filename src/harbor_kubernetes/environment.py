@@ -25,7 +25,6 @@ from harbor.environments.capabilities import (
 )
 from harbor.models.task.config import (
     EnvironmentConfig,
-    HealthcheckConfig,
     NetworkMode,
     NetworkPolicy,
     TpuSpec,
@@ -37,13 +36,14 @@ from kubernetes import config as k8s_config
 from kubernetes.config.incluster_config import SERVICE_TOKEN_FILENAME
 from kubernetes.config.kube_config import KUBE_CONFIG_DEFAULT_LOCATION
 from kubernetes.stream import stream
-from pydantic import BaseModel, ConfigDict
+
 
 from harbor_kubernetes.network_policy import (
     CILIUM_POLICY_GROUP,
     CILIUM_POLICY_KIND,
     CILIUM_POLICY_PLURAL,
     CILIUM_POLICY_VERSION,
+    DNS_PORT,
     PUBLIC_NETWORK_REFUSAL,
     SESSION_ID_ANNOTATION,
     SESSION_LABEL,
@@ -54,10 +54,10 @@ from harbor_kubernetes.network_policy import (
     validated_pod_labels,
 )
 from harbor_kubernetes.transport import (
-    _DIRECTORY_PATH_EXIT,
-    _MISSING_PATH_EXIT,
-    _TIMEOUT_EXIT_CODE,
-    _TIMEOUT_KILL_AFTER_SEC,
+    DIRECTORY_PATH_EXIT,
+    MISSING_PATH_EXIT,
+    TIMEOUT_EXIT_CODE,
+    TIMEOUT_KILL_AFTER_SEC,
     DOWNLOAD_DIR_SCRIPT,
     DOWNLOAD_FILE_SCRIPT,
     UPLOAD_DIR_SCRIPT,
@@ -76,7 +76,6 @@ DEFAULT_IMAGE_PULL_POLICY = "IfNotPresent"
 DEFAULT_POD_READY_TIMEOUT_SEC = 900.0
 LOOPBACK_NAMESERVER = "127.0.0.1"
 RUNNER_RESOLV_CONF = Path("/etc/resolv.conf")
-DNS_PORT = "53"
 K8S_NAME_MAX_LENGTH = 63
 COMPOSE_FILE_NAME = "docker-compose.yaml"
 POD_START_FAILURES = frozenset(
@@ -213,16 +212,23 @@ class CiliumPolicyApi(Protocol):
     ) -> object: ...
 
 
-class _LiveObjectMetadata(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    resourceVersion: str
-
-
-class _LiveObject(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    metadata: _LiveObjectMetadata
+def _resource_version(live: object) -> str:
+    """Return a Cilium object's resource version or reject an invalid API response."""
+    if not isinstance(live, Mapping):
+        raise RuntimeError(
+            f"live {CILIUM_POLICY_KIND} carries no metadata.resourceVersion"
+        )
+    metadata = live.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError(
+            f"live {CILIUM_POLICY_KIND} carries no metadata.resourceVersion"
+        )
+    resource_version = metadata.get("resourceVersion")
+    if not isinstance(resource_version, str):
+        raise RuntimeError(
+            f"live {CILIUM_POLICY_KIND} carries no metadata.resourceVersion"
+        )
+    return resource_version
 
 
 type ExecOpener = Callable[[str, str, list[str], bool], ExecStream]
@@ -315,7 +321,7 @@ class KubernetesEnvironment(BaseEnvironment):
         self.namespace = namespace
         self.kube_context = kube_context
         self.runtime_class_name = runtime_class_name
-        self.pod_labels = validated_pod_labels(dict(pod_labels or {}))
+        self.pod_labels = validated_pod_labels(pod_labels)
         self.annotations = dict(annotations or {})
         self.image_pull_policy = image_pull_policy
         self.pod_ready_timeout_sec = pod_ready_timeout_sec
@@ -329,7 +335,7 @@ class KubernetesEnvironment(BaseEnvironment):
         self._connected_apis: KubernetesApis | None = apis
         self._pod_started = False
         self._pod_owner: OwnerReference | None = None
-        self._policy_created = False
+
         self._cluster_dns_target: str | None = None
         super().__init__(
             environment_dir=environment_dir,
@@ -582,7 +588,7 @@ class KubernetesEnvironment(BaseEnvironment):
         await self._apply_policy_object(self.network_policy)
         await self._create_pod()
         self._pod_started = True
-        if self._policy_created:
+        if self.network_policy.network_mode != NetworkMode.PUBLIC:
             await self._own_policy_object()
         await self._wait_for_pod_ready()
         await self._wait_for_exec_ready()
@@ -593,20 +599,12 @@ class KubernetesEnvironment(BaseEnvironment):
 
     async def create_trial_directories(self) -> None:
         """Create Harbor writable mount targets before the trial starts."""
-        results = [await self.ensure_dirs(self._mount_targets(writable_only=True))]
-        for result in results:
-            if result is not None and result.return_code != 0:
-                raise RuntimeError(
-                    f"Could not create the trial's directories in pod {self.pod_name}: "
-                    + (result.stderr or result.stdout or "no output")
-                )
-
-    @override
-    async def run_healthcheck(
-        self, healthcheck: HealthcheckConfig | None = None
-    ) -> None:
-        """Run Harbor's task healthcheck without host-specific side effects."""
-        await super().run_healthcheck(healthcheck)
+        result = await self.ensure_dirs(self._mount_targets(writable_only=True))
+        if result is not None and result.return_code != 0:
+            raise RuntimeError(
+                f"Could not create the trial's directories in pod {self.pod_name}: "
+                + (result.stderr or result.stdout or "no output")
+            )
 
     @override
     async def stop(self, delete: bool) -> None:
@@ -631,7 +629,7 @@ class KubernetesEnvironment(BaseEnvironment):
         await self._wait_for_pod_gone()
         self._pod_started = False
         self._pod_owner = None
-        if self._policy_created:
+        if self.network_policy.network_mode != NetworkMode.PUBLIC:
             await self._delete_policy_object()
 
     @override
@@ -645,7 +643,7 @@ class KubernetesEnvironment(BaseEnvironment):
     async def _apply_policy_object(self, network_policy: NetworkPolicy) -> None:
         desired = self.network_policy_manifest(network_policy)
         if desired is None:
-            if self._policy_created:
+            if self._pod_started:
                 await self._delete_policy_object()
             return
         apis = await self._apis()
@@ -679,9 +677,7 @@ class KubernetesEnvironment(BaseEnvironment):
                     plural=CILIUM_POLICY_PLURAL,
                     name=self.network_policy_name,
                 )
-                desired["metadata"]["resourceVersion"] = _LiveObject.model_validate(
-                    live
-                ).metadata.resourceVersion
+                desired["metadata"]["resourceVersion"] = _resource_version(live)
                 try:
                     await asyncio.to_thread(
                         apis.cilium_policies.replace_namespaced_custom_object,
@@ -699,9 +695,7 @@ class KubernetesEnvironment(BaseEnvironment):
                     ):
                         raise
                 else:
-                    self._policy_created = True
                     return
-        self._policy_created = True
 
     async def _own_policy_object(self) -> None:
         """Name the trial pod as its policy owner without changing the policy.
@@ -749,7 +743,7 @@ class KubernetesEnvironment(BaseEnvironment):
         except k8s_client.ApiException as error:
             if error.status != 404:
                 raise
-        self._policy_created = False
+
 
     async def _create_pod(self) -> None:
         apis = await self._apis()
@@ -1009,7 +1003,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 script = f"su {shlex.quote(user)} -s /bin/bash -c {shlex.quote(script)}"
         if timeout_sec:
             script = (
-                f"timeout -k {_TIMEOUT_KILL_AFTER_SEC} {timeout_sec} "
+                f"timeout -k {TIMEOUT_KILL_AFTER_SEC} {timeout_sec} "
                 + f"sh -c {shlex.quote(script)}"
             )
         return script
@@ -1031,7 +1025,7 @@ class KubernetesEnvironment(BaseEnvironment):
             timeout_sec=timeout_sec,
         )
         client_timeout = (
-            None if not timeout_sec else timeout_sec + _TIMEOUT_KILL_AFTER_SEC + 15
+            None if not timeout_sec else timeout_sec + TIMEOUT_KILL_AFTER_SEC + 15
         )
         try:
             code, stdout, stderr = await self._run(
@@ -1041,7 +1035,7 @@ class KubernetesEnvironment(BaseEnvironment):
             return ExecResult(
                 stdout=None,
                 stderr=f"Command timed out after {timeout_sec} seconds",
-                return_code=_TIMEOUT_EXIT_CODE,
+                return_code=TIMEOUT_EXIT_CODE,
             )
         return ExecResult(
             stdout=decode_output(stdout), stderr=decode_output(stderr), return_code=code
@@ -1083,9 +1077,9 @@ class KubernetesEnvironment(BaseEnvironment):
         code, stdout, stderr = await self._run(
             ["sh", "-c", DOWNLOAD_FILE_SCRIPT, "sh", source_path]
         )
-        if code == _MISSING_PATH_EXIT:
+        if code == MISSING_PATH_EXIT:
             raise FileNotFoundError(f"{self.pod_name}:{source_path} does not exist")
-        if code == _DIRECTORY_PATH_EXIT:
+        if code == DIRECTORY_PATH_EXIT:
             raise IsADirectoryError(f"{self.pod_name}:{source_path} is a directory")
         if code != 0:
             raise RuntimeError(
@@ -1101,7 +1095,7 @@ class KubernetesEnvironment(BaseEnvironment):
         code, stdout, stderr = await self._run(
             ["sh", "-c", DOWNLOAD_DIR_SCRIPT, "sh", source_dir]
         )
-        if code == _MISSING_PATH_EXIT:
+        if code == MISSING_PATH_EXIT:
             raise FileNotFoundError(f"{self.pod_name}:{source_dir} is not a directory")
         if code != 0:
             raise RuntimeError(
