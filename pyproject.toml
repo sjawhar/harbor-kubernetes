@@ -55,6 +55,10 @@ typeCheckingMode = "recommended"
 failOnWarnings = true
 reportAny = false
 reportExplicitAny = false
+# Harbor ships annotated source without a py.typed marker, so its modules raise
+# reportMissingTypeStubs while basedpyright still reads their real types from source.
+# Stubbing them by hand would replace those types and hide the drift the 0.23/0.24 CI
+# matrix exists to catch; an untyped surface still fails through reportUnknown*.
 reportMissingTypeStubs = false
 reportUnusedCallResult = false
 stubPath = "typings"
