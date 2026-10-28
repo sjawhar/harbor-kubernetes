@@ -48,6 +48,7 @@ from harbor_kubernetes.network_policy import (
     SESSION_ID_ANNOTATION,
     SESSION_LABEL,
     CiliumNetworkPolicyManifest,
+    CiliumPolicyOwnerPatch,
     OwnerReference,
     build_network_policy_manifest,
     validated_pod_labels,
@@ -189,6 +190,16 @@ class CiliumPolicyApi(Protocol):
         body: CiliumNetworkPolicyManifest,
     ) -> object: ...
 
+    def patch_namespaced_custom_object(
+        self,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        name: str,
+        body: CiliumPolicyOwnerPatch,
+    ) -> object: ...
+
     def delete_namespaced_custom_object(
         self, group: str, version: str, namespace: str, plural: str, name: str
     ) -> object: ...
@@ -250,6 +261,9 @@ class KubernetesEnvironment(BaseEnvironment):
     POLICY_PROBE_INTERVAL_SEC = 2.0
     POLICY_CONVERGE_TIMEOUT_SEC = 60.0
     POD_DELETE_TIMEOUT_SEC = 60.0
+    # Whole-object policy replacements retry after a concurrent status update changes
+    # the resource version between the read and replace.
+    POLICY_REPLACE_ATTEMPTS = 5
     EXEC_READY_ATTEMPTS = 60
 
     def __init__(
@@ -545,7 +559,7 @@ class KubernetesEnvironment(BaseEnvironment):
         await self._apply_policy_object(self.network_policy)
         await self._create_pod()
         self._pod_started = True
-        await self._apply_policy_object(self.network_policy)
+        await self._own_policy_object()
         await self._wait_for_pod_ready()
         await self._wait_for_exec_ready()
         if self.network_policy.network_mode == NetworkMode.NO_NETWORK:
@@ -628,27 +642,73 @@ class KubernetesEnvironment(BaseEnvironment):
                 ) from error
             if error.status != 409:
                 raise
-            live = await asyncio.to_thread(
-                apis.cilium_policies.get_namespaced_custom_object,
-                group=CILIUM_POLICY_GROUP,
-                version=CILIUM_POLICY_VERSION,
-                namespace=self.namespace,
-                plural=CILIUM_POLICY_PLURAL,
-                name=self.network_policy_name,
-            )
-            desired["metadata"]["resourceVersion"] = _LiveObject.model_validate(
-                live
-            ).metadata.resourceVersion
-            await asyncio.to_thread(
-                apis.cilium_policies.replace_namespaced_custom_object,
-                group=CILIUM_POLICY_GROUP,
-                version=CILIUM_POLICY_VERSION,
-                namespace=self.namespace,
-                plural=CILIUM_POLICY_PLURAL,
-                name=self.network_policy_name,
-                body=desired,
-            )
+            # In place, never delete-and-create: the gap between the two would leave the
+            # pod under no policy of its own. A custom resource is replaced only at the
+            # resourceVersion it holds, and a status update can change that version
+            # between the read and replace.
+            for attempt in range(1, self.POLICY_REPLACE_ATTEMPTS + 1):
+                live = await asyncio.to_thread(
+                    apis.cilium_policies.get_namespaced_custom_object,
+                    group=CILIUM_POLICY_GROUP,
+                    version=CILIUM_POLICY_VERSION,
+                    namespace=self.namespace,
+                    plural=CILIUM_POLICY_PLURAL,
+                    name=self.network_policy_name,
+                )
+                desired["metadata"]["resourceVersion"] = _LiveObject.model_validate(
+                    live
+                ).metadata.resourceVersion
+                try:
+                    await asyncio.to_thread(
+                        apis.cilium_policies.replace_namespaced_custom_object,
+                        group=CILIUM_POLICY_GROUP,
+                        version=CILIUM_POLICY_VERSION,
+                        namespace=self.namespace,
+                        plural=CILIUM_POLICY_PLURAL,
+                        name=self.network_policy_name,
+                        body=desired,
+                    )
+                except k8s_client.ApiException as replace_error:
+                    if (
+                        replace_error.status != 409
+                        or attempt == self.POLICY_REPLACE_ATTEMPTS
+                    ):
+                        raise
+                else:
+                    return
         self._policy_created = True
+
+    async def _own_policy_object(self) -> None:
+        """Name the trial pod as its policy owner without changing the policy.
+
+        A JSON merge patch of ``metadata.ownerReferences`` carries no resource version,
+        so a Cilium status update cannot turn the owner update into a stale-version
+        conflict. The policy spec and labels remain as the first apply wrote them. If
+        the policy is gone, write it again with the pod owner included.
+        """
+        if self._pod_owner is None:
+            raise RuntimeError(
+                f"Pod {self.pod_name} has no uid recorded, so its "
+                + f"{CILIUM_POLICY_KIND} cannot name it as owner."
+            )
+        apis = await self._apis()
+        patch: CiliumPolicyOwnerPatch = {
+            "metadata": {"ownerReferences": [self._pod_owner]}
+        }
+        try:
+            await asyncio.to_thread(
+                apis.cilium_policies.patch_namespaced_custom_object,
+                group=CILIUM_POLICY_GROUP,
+                version=CILIUM_POLICY_VERSION,
+                namespace=self.namespace,
+                plural=CILIUM_POLICY_PLURAL,
+                name=self.network_policy_name,
+                body=patch,
+            )
+        except k8s_client.ApiException as error:
+            if error.status != 404:
+                raise
+            await self._apply_policy_object(self.network_policy)
 
     async def _delete_policy_object(self) -> None:
         apis = await self._apis()

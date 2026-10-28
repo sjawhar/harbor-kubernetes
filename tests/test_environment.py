@@ -6,13 +6,14 @@ import os
 import stat
 import subprocess
 from pathlib import Path
-from typing import Callable, override
+from typing import Callable, Final, override
 
 import pytest
 from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.models.trial.config import ServiceVolumeConfig
 from harbor.models.trial.paths import TrialPaths
 from kubernetes import client as k8s_client
+from pydantic import TypeAdapter
 
 from harbor_kubernetes.environment import (
     RUNNER_RESOLV_CONF,
@@ -25,6 +26,7 @@ from harbor_kubernetes.network_policy import (
     SESSION_ID_ANNOTATION,
     SESSION_LABEL,
     CiliumNetworkPolicyManifest,
+    CiliumPolicyOwnerPatch,
 )
 
 _IMAGE = "registry.example/harbor-task:sha-123"
@@ -33,6 +35,8 @@ _SESSION = "task-7__Ab3dE__env"
 _POD = "task-7-ab3de-env"
 _POLICY = f"{_POD}-sandbox-egress"
 _POD_UID = "0f6c2a8e-5d1b-4f7a-9c3e-2b8d4a6f1e90"
+
+_OWNER_PATCH: Final = TypeAdapter(CiliumPolicyOwnerPatch)
 
 
 type Answer = Callable[[list[str]], tuple[int, bytes, bytes]]
@@ -126,10 +130,17 @@ class FakeCluster:
         egress_closes_after: int = 0,
         waiting_reason: str | None = None,
         cilium_create_error: k8s_client.ApiException | None = None,
+        cilium_reports_status: bool = False,
     ) -> None:
         self.pods: dict[str, k8s_client.V1Pod] = {}
         self.policies: dict[str, CiliumNetworkPolicyManifest] = {}
         self.resource_versions: dict[str, int] = {}
+        # Cilium status writes that have not landed, per policy. Each lands at the
+        # worst moment for this provider: after its next read and before its replace,
+        # or immediately before an owner patch.
+        self.status_writes_pending: dict[str, int] = {}
+        self.status_writes = 0
+        self._cilium_reports_status = cilium_reports_status
         self.calls: list[tuple[str, str]] = []
         self.pod_deletions: list[k8s_client.V1DeleteOptions | None] = []
         self.egress_closes_after = egress_closes_after
@@ -232,8 +243,22 @@ class FakeCluster:
         self.calls.append(("create_policy", name))
         self.policies[name] = body
         self.resource_versions[name] = 1
+        self._spec_written(name)
         self.probes = 0
         return body
+
+    def _spec_written(self, name: str) -> None:
+        if self._cilium_reports_status:
+            self.status_writes_pending[name] = (
+                self.status_writes_pending.get(name, 0) + 1
+            )
+
+    def _land_status_write(self, name: str) -> None:
+        """Land one pending Cilium status write for *name*, if present."""
+        if self.status_writes_pending.get(name, 0) > 0:
+            self.status_writes_pending[name] -= 1
+            self.status_writes += 1
+            self.resource_versions[name] += 1
 
     def get_namespaced_custom_object(
         self, group: str, version: str, namespace: str, plural: str, name: str
@@ -243,12 +268,46 @@ class FakeCluster:
         if name not in self.policies:
             raise _not_found()
         policy = self.policies[name]
-        return {
+        live = {
+            **policy,
             "metadata": {
                 **policy["metadata"],
                 "resourceVersion": str(self.resource_versions[name]),
-            }
+            },
         }
+        self._land_status_write(name)
+        return live
+
+    def patch_namespaced_custom_object(
+        self,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        name: str,
+        body: CiliumPolicyOwnerPatch,
+    ) -> object:
+        """Apply the owner-only JSON merge patch this provider sends."""
+        self._require_cilium(group, version, plural)
+        del namespace
+        patch = _OWNER_PATCH.validate_python(body)
+        assert body == {
+            "metadata": {"ownerReferences": patch["metadata"]["ownerReferences"]}
+        }, body
+        if name not in self.policies:
+            raise _not_found()
+        self._land_status_write(name)
+        self.calls.append(("patch_policy", name))
+        policy = self.policies[name]
+        self.policies[name] = {
+            **policy,
+            "metadata": {
+                **policy["metadata"],
+                "ownerReferences": patch["metadata"]["ownerReferences"],
+            },
+        }
+        self.resource_versions[name] += 1
+        return body
 
     def replace_namespaced_custom_object(
         self,
@@ -261,13 +320,14 @@ class FakeCluster:
     ) -> object:
         self._require_cilium(group, version, plural)
         del namespace
-        assert body["metadata"].get("resourceVersion") == str(
-            self.resource_versions[name]
-        )
+        if body["metadata"].get("resourceVersion") != str(self.resource_versions[name]):
+            self.calls.append(("replace_policy_conflict", name))
+            raise k8s_client.ApiException(status=409, reason="Conflict")
         self.calls.append(("replace_policy", name))
         self.policies[name] = body
         self.resource_versions[name] += 1
         self.probes = 0
+        self._spec_written(name)
         return body
 
     def delete_namespaced_custom_object(
@@ -376,7 +436,7 @@ async def test_start_creates_a_root_pod_with_safety_controls(tmp_path: Path) -> 
     assert cluster.calls == [
         ("create_policy", _POLICY),
         ("create_pod", _POD),
-        ("replace_policy", _POLICY),
+        ("patch_policy", _POLICY),
     ]
     pod = cluster.pods[_POD]
     metadata = pod.metadata
@@ -476,7 +536,7 @@ async def test_no_network_policy_exists_before_the_pod_and_waits_for_enforcement
     assert cluster.calls[:3] == [
         ("create_policy", _POLICY),
         ("create_pod", _POD),
-        ("replace_policy", _POLICY),
+        ("patch_policy", _POLICY),
     ]
     assert cluster.probes == 4
     assert cluster.policies[_POLICY]["spec"].get("egressDeny") == [

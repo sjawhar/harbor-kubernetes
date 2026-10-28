@@ -121,6 +121,16 @@ class CiliumNetworkPolicyManifest(TypedDict):
     spec: CiliumPolicySpec
 
 
+class _OwnerPatchMetadata(TypedDict):
+    ownerReferences: list[OwnerReference]
+
+
+class CiliumPolicyOwnerPatch(TypedDict):
+    """A JSON merge patch naming the policy's owner and changing nothing else."""
+
+    metadata: _OwnerPatchMetadata
+
+
 def validated_pod_labels(pod_labels: dict[str, str] | None) -> dict[str, str]:
     """Copy caller labels while reserving the provider's pod identity label."""
     labels = dict(pod_labels or {})

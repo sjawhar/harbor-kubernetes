@@ -56,7 +56,7 @@ async def test_start_boots_one_root_pod_carrying_the_labels_and_runtime_class(
     assert cluster.calls == [
         ("create_policy", _POLICY),
         ("create_pod", _POD),
-        ("replace_policy", _POLICY),
+        ("patch_policy", _POLICY),
     ]
     policy = cluster.policies[_POLICY]
     assert policy["metadata"]["labels"] == {
@@ -119,7 +119,7 @@ async def test_a_pod_left_by_an_earlier_attempt_at_the_same_trial_is_replaced(
         ("create_policy", _POLICY),
         ("delete_pod", _POD),
         ("create_pod", _POD),
-        ("replace_policy", _POLICY),
+        ("patch_policy", _POLICY),
     ]
     metadata = cluster.pods[_POD].metadata
     assert metadata is not None
@@ -191,7 +191,7 @@ async def test_a_no_network_baseline_is_in_force_before_the_pod_exists(
     assert cluster.calls == [
         ("create_policy", _POLICY),
         ("create_pod", _POD),
-        ("replace_policy", _POLICY),
+        ("patch_policy", _POLICY),
     ]
     policy = cluster.policies[_POLICY]
     assert policy["apiVersion"] == "cilium.io/v2"
@@ -308,6 +308,113 @@ async def test_a_policy_another_writer_updated_is_still_replaced_in_place(
     assert cluster.policies[_POLICY]["spec"].get("egressDeny") == [
         {"toEntities": ["all"]}
     ]
+
+
+@pytest.mark.parametrize(
+    "baseline",
+    [NetworkMode.ALLOWLIST, NetworkMode.NO_NETWORK],
+    ids=["allowlist-baseline", "no-network-baseline"],
+)
+async def test_ciliums_status_write_after_the_policy_is_created_never_fails_the_start(
+    tmp_path: Path, baseline: NetworkMode
+) -> None:
+    """A Cilium status write after policy creation must not fail trial startup."""
+    cluster = FakeCluster(cilium_reports_status=True, egress_closes_after=1)
+    environment = _environment(tmp_path, cluster, baseline=baseline)
+    created = environment.network_policy_manifest(environment.network_policy)
+    assert created is not None
+
+    await environment.start(False)
+
+    assert cluster.status_writes == 1
+    policy = cluster.policies[_POLICY]
+    assert policy["metadata"].get("ownerReferences") == [
+        {"apiVersion": "v1", "kind": "Pod", "name": _POD, "uid": _POD_UID}
+    ]
+    assert policy["spec"] == created["spec"]
+    assert policy["metadata"]["labels"] == created["metadata"]["labels"]
+    assert cluster.calls == [
+        ("create_policy", _POLICY),
+        ("create_pod", _POD),
+        ("patch_policy", _POLICY),
+    ]
+
+
+async def test_a_policy_gone_before_its_owner_is_named_is_written_whole_again(
+    tmp_path: Path,
+) -> None:
+    """A policy deleted after the first apply is written again with its pod owner."""
+
+    class PolicyLostOnPodCreate(FakeCluster):
+        @override
+        def create_namespaced_pod(
+            self, namespace: str, body: k8s_client.V1Pod
+        ) -> k8s_client.V1Pod:
+            created = super().create_namespaced_pod(namespace=namespace, body=body)
+            del self.policies[_POLICY]
+            return created
+
+    cluster = PolicyLostOnPodCreate()
+    environment = _environment(tmp_path, cluster)
+
+    await environment.start(False)
+
+    assert cluster.calls == [
+        ("create_policy", _POLICY),
+        ("create_pod", _POD),
+        ("create_policy", _POLICY),
+    ]
+    policy = cluster.policies[_POLICY]
+    assert policy["metadata"].get("ownerReferences") == [
+        {"apiVersion": "v1", "kind": "Pod", "name": _POD, "uid": _POD_UID}
+    ]
+    created = environment.network_policy_manifest(environment.network_policy)
+    assert created is not None
+    assert policy["spec"] == created["spec"]
+
+
+async def test_a_phase_switch_racing_ciliums_status_write_replaces_at_the_fresh_version(
+    tmp_path: Path,
+) -> None:
+    """A phase switch retries a 409 at a freshly read policy resource version."""
+    cluster = FakeCluster(cilium_reports_status=True)
+    environment = _environment(tmp_path, cluster)
+    await environment.start(False)
+    cluster.status_writes_pending[_POLICY] = 2
+
+    await environment.set_network_policy(_policy(NetworkMode.NO_NETWORK))
+
+    assert cluster.calls[3:] == [
+        ("replace_policy_conflict", _POLICY),
+        ("replace_policy_conflict", _POLICY),
+        ("replace_policy", _POLICY),
+    ]
+    policy = cluster.policies[_POLICY]
+    desired = environment.network_policy_manifest(_policy(NetworkMode.NO_NETWORK))
+    assert desired is not None
+    assert policy["spec"] == desired["spec"]
+    assert policy["metadata"].get("ownerReferences") == [
+        {"apiVersion": "v1", "kind": "Pod", "name": _POD, "uid": _POD_UID}
+    ]
+
+
+async def test_a_replace_refused_on_every_attempt_fails_the_phase_switch(
+    tmp_path: Path,
+) -> None:
+    """A phase switch stops after its bounded number of conflicting replaces."""
+    cluster = FakeCluster()
+    environment = _environment(tmp_path, cluster)
+    await environment.start(False)
+    before = cluster.policies[_POLICY]
+    attempts = environment.POLICY_REPLACE_ATTEMPTS
+    cluster.status_writes_pending[_POLICY] = attempts
+
+    with pytest.raises(k8s_client.ApiException) as refused:
+        await environment.set_network_policy(_policy(NetworkMode.NO_NETWORK))
+
+    assert refused.value.status == 409
+    assert cluster.calls[3:] == [("replace_policy_conflict", _POLICY)] * attempts
+    assert cluster.policies[_POLICY] == before
 
 
 def test_an_allowlist_reaches_ipv6_addresses_and_ranges_as_cidrs(
