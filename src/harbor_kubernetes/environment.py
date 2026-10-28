@@ -252,9 +252,8 @@ class KubernetesEnvironment(BaseEnvironment):
     """Single-pod Harbor environment on any Kubernetes cluster.
 
     The environment creates a plain pod from a task's prebuilt image and executes commands
-    or transfers files over Kubernetes exec. Network-restricted tasks require Cilium because
-    the policy uses CiliumNetworkPolicy. A public task uses Harbor's public policy only after
-    the public-network cutover in this module.
+    or transfers files over Kubernetes exec. A public trial sends no Cilium request. A
+    trial with network rules gets a CiliumNetworkPolicy, so it requires Cilium.
     """
 
     POLL_INTERVAL_SEC = 1.0
@@ -559,7 +558,8 @@ class KubernetesEnvironment(BaseEnvironment):
         await self._apply_policy_object(self.network_policy)
         await self._create_pod()
         self._pod_started = True
-        await self._own_policy_object()
+        if self._policy_created:
+            await self._own_policy_object()
         await self._wait_for_pod_ready()
         await self._wait_for_exec_ready()
         if self.network_policy.network_mode == NetworkMode.NO_NETWORK:

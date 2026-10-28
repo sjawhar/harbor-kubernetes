@@ -28,6 +28,39 @@ async def test_public_network_is_allowed_without_creating_a_cilium_policy(
     assert cluster.policies == {}
 
 
+async def test_a_public_trial_starts_where_cilium_requests_are_refused(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A public trial sends no Cilium request, so a role without Cilium rights runs it."""
+    cluster = FakeCluster()
+    cilium_requests: list[str] = []
+
+    def refuse(**kwargs: object) -> object:
+        cilium_requests.append(str(kwargs.get("name", kwargs.get("plural"))))
+        raise k8s_client.ApiException(status=403, reason="Forbidden")
+
+    for method in (
+        "create_namespaced_custom_object",
+        "get_namespaced_custom_object",
+        "patch_namespaced_custom_object",
+        "replace_namespaced_custom_object",
+        "delete_namespaced_custom_object",
+    ):
+        monkeypatch.setattr(cluster, method, refuse)
+    environment = _environment(
+        tmp_path,
+        cluster,
+        baseline=NetworkMode.PUBLIC,
+        phase=NetworkMode.PUBLIC,
+    )
+
+    await environment.start(False)
+    await environment.stop(delete=True)
+
+    assert cilium_requests == []
+    assert ("create_pod", environment.pod_name) in cluster.calls
+
+
 def test_allow_public_network_false_restores_the_public_network_refusal(
     tmp_path,
 ) -> None:
