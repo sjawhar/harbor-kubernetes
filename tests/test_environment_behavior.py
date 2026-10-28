@@ -126,6 +126,24 @@ async def test_a_pod_left_by_an_earlier_attempt_at_the_same_trial_is_replaced(
     assert metadata.annotations == {SESSION_ID_ANNOTATION: _SESSION}
 
 
+async def test_a_policy_left_by_an_earlier_attempt_is_replaced_and_deleted_at_stop(
+    tmp_path: Path,
+) -> None:
+    cluster = FakeCluster()
+    environment = _environment(tmp_path, cluster)
+    leftover = environment.network_policy_manifest(environment.network_policy)
+    assert leftover is not None
+    cluster.policies[_POLICY] = leftover
+    cluster.resource_versions[_POLICY] = 4
+
+    await environment.start(False)
+    await environment.stop(delete=True)
+
+    assert cluster.calls[0] == ("replace_policy", _POLICY)
+    assert cluster.calls[-1] == ("delete_policy", _POLICY)
+    assert cluster.policies == {}
+
+
 async def test_a_pod_another_session_folds_onto_is_never_deleted(
     tmp_path: Path,
 ) -> None:

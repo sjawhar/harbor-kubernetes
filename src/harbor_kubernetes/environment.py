@@ -675,6 +675,7 @@ class KubernetesEnvironment(BaseEnvironment):
                     ):
                         raise
                 else:
+                    self._policy_created = True
                     return
         self._policy_created = True
 
