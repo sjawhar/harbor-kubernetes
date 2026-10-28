@@ -247,6 +247,21 @@ def _k8s_name(name: str) -> str:
     return f"{prefix}-{digest}"
 
 
+def _validated_cluster_dns_ip(target: str) -> str:
+    """Return a non-loopback, specified DNS IP address or reject the configured target."""
+    try:
+        address = ip_address(target)
+    except ValueError as error:
+        raise RuntimeError(
+            f"cluster_dns_ip must be a non-loopback, specified IP address; got {target!r}"
+        ) from error
+    if address.is_loopback or address.is_unspecified:
+        raise RuntimeError(
+            f"cluster_dns_ip must be a non-loopback, specified IP address; got {target!r}"
+        )
+    return str(address)
+
+
 def egress_probe(target: str) -> str:
     """Return a command that reports whether TCP DNS egress remains reachable."""
     return (
@@ -871,7 +886,7 @@ class KubernetesEnvironment(BaseEnvironment):
     def cluster_dns_probe_target(self) -> str:
         """Return the cluster DNS address used by no-network convergence probes."""
         if self.cluster_dns_ip is not None:
-            return self.cluster_dns_ip
+            return _validated_cluster_dns_ip(self.cluster_dns_ip)
         if Path(SERVICE_TOKEN_FILENAME).exists():
             try:
                 text = RUNNER_RESOLV_CONF.read_text(encoding="utf-8")
@@ -884,9 +899,8 @@ class KubernetesEnvironment(BaseEnvironment):
                 parts = line.split()
                 if len(parts) >= 2 and parts[0] == "nameserver":
                     try:
-                        if not ip_address(parts[1]).is_loopback:
-                            return parts[1]
-                    except ValueError:
+                        return _validated_cluster_dns_ip(parts[1])
+                    except RuntimeError:
                         continue
             raise RuntimeError(
                 f"no non-loopback nameserver in {RUNNER_RESOLV_CONF}; cannot target the "
@@ -914,7 +928,7 @@ class KubernetesEnvironment(BaseEnvironment):
         service = service_result
         cluster_ip = None if service.spec is None else service.spec.cluster_ip
         if cluster_ip:
-            return cluster_ip
+            return _validated_cluster_dns_ip(cluster_ip)
         raise RuntimeError(
             "the kube-system/kube-dns Service has no ClusterIP for the no-network "
             + "convergence probe; set cluster_dns_ip explicitly."

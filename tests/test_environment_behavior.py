@@ -1057,3 +1057,33 @@ async def test_missing_namespace_status_body_reraises_the_original_api_exception
 
     assert raised.value is error
     assert cluster.pods == {}
+
+
+@pytest.mark.parametrize(
+    ("cluster_dns_ip", "service_dns_ip"),
+    [
+        ("127.0.0.1", "10.96.0.10"),
+        ("kube-dns.example", "10.96.0.10"),
+        ("10.96.0.0/24", "10.96.0.10"),
+        ("0.0.0.0", "10.96.0.10"),
+        (None, "None"),
+    ],
+    ids=["loopback", "hostname", "cidr", "unspecified", "headless-service"],
+)
+async def test_invalid_cluster_dns_target_refuses_before_creating_a_pod(
+    tmp_path: Path, cluster_dns_ip: str | None, service_dns_ip: str
+) -> None:
+    cluster = FakeCluster()
+    cluster.service_dns_ip = service_dns_ip
+    environment = _environment(
+        tmp_path,
+        cluster,
+        baseline=NetworkMode.NO_NETWORK,
+        cluster_dns_ip=cluster_dns_ip,
+    )
+
+    with pytest.raises(RuntimeError, match="cluster_dns_ip"):
+        await environment.start(False)
+
+    assert cluster.calls == []
+    assert cluster.pods == {}
