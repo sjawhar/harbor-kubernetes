@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Final, Protocol, Required, TypeGuard, TypedDict, Unpack, override
+from typing import Final, Protocol, Required, TypedDict, TypeGuard, Unpack, override
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.capabilities import (
@@ -37,7 +37,6 @@ from kubernetes.config.incluster_config import SERVICE_TOKEN_FILENAME
 from kubernetes.config.kube_config import KUBE_CONFIG_DEFAULT_LOCATION
 from kubernetes.stream import stream
 
-
 from harbor_kubernetes.network_policy import (
     CILIUM_POLICY_GROUP,
     CILIUM_POLICY_KIND,
@@ -55,11 +54,11 @@ from harbor_kubernetes.network_policy import (
 )
 from harbor_kubernetes.transport import (
     DIRECTORY_PATH_EXIT,
+    DOWNLOAD_DIR_SCRIPT,
+    DOWNLOAD_FILE_SCRIPT,
     MISSING_PATH_EXIT,
     TIMEOUT_EXIT_CODE,
     TIMEOUT_KILL_AFTER_SEC,
-    DOWNLOAD_DIR_SCRIPT,
-    DOWNLOAD_FILE_SCRIPT,
     UPLOAD_DIR_SCRIPT,
     UPLOAD_FILE_SCRIPT,
     ExecStream,
@@ -744,7 +743,6 @@ class KubernetesEnvironment(BaseEnvironment):
         except k8s_client.ApiException as error:
             if error.status != 404:
                 raise
-
 
     async def _create_pod(self) -> None:
         apis = await self._apis()

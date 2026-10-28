@@ -1,16 +1,13 @@
 from collections.abc import Mapping
 from datetime import datetime
 
-
 class Configuration:
     def __init__(self) -> None: ...
-
 
 class ApiClient:
     configuration: Configuration
     def __init__(self, configuration: Configuration | None = None) -> None: ...
     def close(self) -> None: ...
-
 
 class ApiException(Exception):
     status: int | None
@@ -19,7 +16,6 @@ class ApiException(Exception):
     def __init__(
         self, status: int | None = None, reason: str | None = None
     ) -> None: ...
-
 
 class V1ObjectMeta:
     name: str | None
@@ -38,12 +34,10 @@ class V1ObjectMeta:
         deletion_timestamp: datetime | None = None,
     ) -> None: ...
 
-
 class V1EnvVar:
     name: str
     value: str | None
     def __init__(self, *, name: str, value: str | None = None) -> None: ...
-
 
 class V1SecurityContext:
     run_as_user: int | None
@@ -51,7 +45,6 @@ class V1SecurityContext:
     def __init__(
         self, *, run_as_user: int | None = None, run_as_group: int | None = None
     ) -> None: ...
-
 
 class V1ResourceRequirements:
     requests: dict[str, str] | None
@@ -63,7 +56,6 @@ class V1ResourceRequirements:
         limits: Mapping[str, str] | None = None,
     ) -> None: ...
 
-
 class V1VolumeMount:
     name: str
     mount_path: str
@@ -72,7 +64,6 @@ class V1VolumeMount:
         self, *, name: str, mount_path: str, read_only: bool | None = None
     ) -> None: ...
 
-
 class V1ImageVolumeSource:
     reference: str | None
     pull_policy: str | None
@@ -80,14 +71,12 @@ class V1ImageVolumeSource:
         self, *, reference: str | None = None, pull_policy: str | None = None
     ) -> None: ...
 
-
 class V1Volume:
     name: str
     image: V1ImageVolumeSource | None
     def __init__(
         self, *, name: str, image: V1ImageVolumeSource | None = None
     ) -> None: ...
-
 
 class V1Container:
     name: str
@@ -113,11 +102,9 @@ class V1Container:
         volume_mounts: list[V1VolumeMount] | None = None,
     ) -> None: ...
 
-
 class V1PodDNSConfig:
     nameservers: list[str] | None
     def __init__(self, *, nameservers: list[str] | None = None) -> None: ...
-
 
 class V1PodSpec:
     containers: list[V1Container]
@@ -141,7 +128,6 @@ class V1PodSpec:
         volumes: list[V1Volume] | None = None,
     ) -> None: ...
 
-
 class V1ContainerStateWaiting:
     reason: str | None
     message: str | None
@@ -149,11 +135,9 @@ class V1ContainerStateWaiting:
         self, *, reason: str | None = None, message: str | None = None
     ) -> None: ...
 
-
 class V1ContainerState:
     waiting: V1ContainerStateWaiting | None
     def __init__(self, *, waiting: V1ContainerStateWaiting | None = None) -> None: ...
-
 
 class V1ContainerStatus:
     name: str
@@ -173,7 +157,6 @@ class V1ContainerStatus:
         state: V1ContainerState | None = None,
     ) -> None: ...
 
-
 class V1PodStatus:
     phase: str | None
     reason: str | None
@@ -187,7 +170,6 @@ class V1PodStatus:
         message: str | None = None,
         container_statuses: list[V1ContainerStatus] | None = None,
     ) -> None: ...
-
 
 class V1Pod:
     metadata: V1ObjectMeta | None
@@ -203,7 +185,6 @@ class V1Pod:
         status: V1PodStatus | None = None,
     ) -> None: ...
 
-
 class V1DeleteOptions:
     grace_period_seconds: int | None
     propagation_policy: str | None
@@ -214,21 +195,17 @@ class V1DeleteOptions:
         propagation_policy: str | None = None,
     ) -> None: ...
 
-
 class V1ServiceSpec:
     cluster_ip: str | None
     def __init__(self, *, cluster_ip: str | None = None) -> None: ...
-
 
 class V1Service:
     spec: V1ServiceSpec | None
     def __init__(self, *, spec: V1ServiceSpec | None = None) -> None: ...
 
-
 class V1NamespaceStatus:
     phase: str | None
     def __init__(self, *, phase: str | None = None) -> None: ...
-
 
 class V1Namespace:
     metadata: V1ObjectMeta | None
@@ -239,7 +216,6 @@ class V1Namespace:
         metadata: V1ObjectMeta | None = None,
         status: V1NamespaceStatus | None = None,
     ) -> None: ...
-
 
 class CoreV1Api:
     api_client: ApiClient
@@ -256,7 +232,6 @@ class CoreV1Api:
     def connect_get_namespaced_pod_exec(
         self, name: str, namespace: str, **kwargs: object
     ) -> object: ...
-
 
 class CustomObjectsApi:
     def __init__(self, api_client: ApiClient | None = None) -> None: ...

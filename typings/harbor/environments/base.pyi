@@ -4,8 +4,6 @@ from collections.abc import Sequence
 from pathlib import Path, PurePath
 from typing import Literal
 
-from pydantic import BaseModel
-
 from harbor.environments.capabilities import (
     EnvironmentCapabilities,
     EnvironmentResourceCapabilities,
@@ -13,16 +11,14 @@ from harbor.environments.capabilities import (
 from harbor.models.task.config import EnvironmentConfig, NetworkPolicy, TpuSpec
 from harbor.models.trial.config import ResourceMode, ServiceVolumeConfig
 from harbor.models.trial.paths import TrialPaths
-
+from pydantic import BaseModel
 
 EnvironmentPath = str | PurePath
-
 
 class ExecResult(BaseModel):
     stdout: str | None
     stderr: str | None
     return_code: int
-
 
 class BaseEnvironment(ABC):
     environment_dir: Path
@@ -98,7 +94,9 @@ class BaseEnvironment(ABC):
     @abstractmethod
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None: ...
     @abstractmethod
-    async def download_file(self, source_path: str, target_path: Path | str) -> None: ...
+    async def download_file(
+        self, source_path: str, target_path: Path | str
+    ) -> None: ...
     @abstractmethod
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None: ...
     @abstractmethod

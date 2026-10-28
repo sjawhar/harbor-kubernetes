@@ -1,7 +1,6 @@
 class _WebSocket:
     def ping(self, payload: str | bytes = "") -> None: ...
 
-
 class WSClient:
     sock: _WebSocket
     def is_open(self) -> bool: ...

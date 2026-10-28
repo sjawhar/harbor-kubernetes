@@ -14,20 +14,17 @@ import pytest
 from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor.models.trial.config import ServiceVolumeConfig
 from kubernetes import client as k8s_client
-from harbor_kubernetes.testing import (
-    IMAGE as _IMAGE,
-    NAMESPACE as _NAMESPACE,
-    POD as _POD,
-    POD_UID as _POD_UID,
-    POLICY as _POLICY,
-    SESSION as _SESSION,
-    FakeCluster,
-    fake_environment,
-    network_policy as _policy,
-)
 
 from harbor_kubernetes.environment import KubernetesEnvironment, KubernetesPodGoneError
 from harbor_kubernetes.network_policy import SESSION_ID_ANNOTATION, SESSION_LABEL
+from harbor_kubernetes.testing import IMAGE as _IMAGE
+from harbor_kubernetes.testing import NAMESPACE as _NAMESPACE
+from harbor_kubernetes.testing import POD as _POD
+from harbor_kubernetes.testing import POD_UID as _POD_UID
+from harbor_kubernetes.testing import POLICY as _POLICY
+from harbor_kubernetes.testing import SESSION as _SESSION
+from harbor_kubernetes.testing import FakeCluster, fake_environment
+from harbor_kubernetes.testing import network_policy as _policy
 
 
 def _environment(
@@ -366,7 +363,7 @@ def test_a_trial_that_asks_for_the_world_is_handled_by_the_public_network_settin
         (NetworkMode.ALLOWLIST, NetworkMode.PUBLIC),
     ):
         cluster = FakeCluster()
-        with pytest.raises(ValueError) as refused:
+        with pytest.raises(ValueError):
             _environment(
                 tmp_path / f"refused-{baseline.value}-{phase.value}",
                 cluster,
@@ -396,8 +393,6 @@ async def test_switching_to_public_deletes_the_restricted_policy_and_leaves_the_
     assert _POLICY not in cluster.policies
     assert _POD in cluster.pods
     assert environment.network_policy.network_mode == NetworkMode.PUBLIC
-
-
 
 
 async def test_a_policy_another_writer_updated_is_still_replaced_in_place(
