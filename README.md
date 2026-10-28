@@ -77,7 +77,7 @@ its own behavior without making this package depend on that host:
 - `create_trial_directories()` creates Harbor's writable mount targets.
 - `resolve_image_mount_reference(reference) -> str` can rewrite an image-volume
   reference for a registry mirror.
-- `cluster_dns_probe_target() -> str` supplies the target for no-network convergence.
+- `async cluster_dns_probe_target() -> str` supplies the target for no-network convergence.
 - `remote_command(...) -> str` builds the command passed through Kubernetes exec.
 - `pod_manifest()` and `network_policy_manifest(network_policy)` expose the two
   Kubernetes manifests a host may extend.

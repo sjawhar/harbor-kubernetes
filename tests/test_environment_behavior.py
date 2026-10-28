@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import pwd
 import stat
+import threading
 import time
 from pathlib import Path
 from typing import override
@@ -563,7 +564,7 @@ def test_the_egress_probe_targets_an_explicit_cluster_dns_ip_not_the_pods_resolv
     assert "/etc/resolv.conf" not in probe
 
 
-def test_the_convergence_target_is_the_runners_non_loopback_nameserver(
+async def test_the_convergence_target_is_the_runners_non_loopback_nameserver(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from harbor_kubernetes import environment as module
@@ -577,16 +578,11 @@ def test_the_convergence_target_is_the_runners_non_loopback_nameserver(
         "nameserver 127.0.0.1\nnameserver 172.20.0.10\n", encoding="utf-8"
     )
     monkeypatch.setattr(module, "RUNNER_RESOLV_CONF", resolver)
-    assert KubernetesEnvironment.cluster_dns_probe_target(environment) == "172.20.0.10"
+    assert await environment.cluster_dns_probe_target() == "172.20.0.10"
 
     resolver.write_text("nameserver 127.0.0.53\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="no non-loopback nameserver"):
-        KubernetesEnvironment.cluster_dns_probe_target(environment)
-
-    monkeypatch.setattr(module, "SERVICE_TOKEN_FILENAME", str(tmp_path / "absent"))
-    environment._connected_apis = None
-    with pytest.raises(RuntimeError, match="cluster_dns_ip"):
-        KubernetesEnvironment.cluster_dns_probe_target(environment)
+        await environment.cluster_dns_probe_target()
 
 
 async def test_exec_keeps_stdout_stderr_and_status_apart_with_cwd_and_env(
@@ -920,17 +916,11 @@ async def test_public_transitions_are_refused_when_public_network_is_disabled(
 
 
 async def test_missing_dns_target_refuses_before_creating_the_pod(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     cluster = FakeCluster()
     cluster.service_dns_ip = None
     environment = _environment(tmp_path, cluster, baseline=NetworkMode.NO_NETWORK)
-    monkeypatch.setattr(
-        type(environment),
-        "cluster_dns_probe_target",
-        KubernetesEnvironment.cluster_dns_probe_target,
-    )
-
     with pytest.raises(RuntimeError, match="cluster_dns_ip"):
         await environment.start(False)
 
@@ -989,22 +979,44 @@ async def test_a_public_trial_starts_where_cilium_requests_are_refused(
     assert ("create_pod", environment.pod_name) in cluster.calls
 
 
-def test_off_cluster_dns_target_uses_kube_dns_service_or_an_explicit_override(
+async def test_off_cluster_dns_target_uses_kube_dns_service_or_an_explicit_override(
     tmp_path: Path,
 ) -> None:
     """No-network convergence finds a cluster address without reading a laptop resolver."""
     cluster = FakeCluster()
     environment = _environment(tmp_path, cluster)
 
-    assert KubernetesEnvironment.cluster_dns_probe_target(environment) == "10.96.0.10"
+    assert await environment.cluster_dns_probe_target() == "10.96.0.10"
 
     override = _environment(tmp_path / "override", cluster, cluster_dns_ip="10.0.0.53")
-    assert KubernetesEnvironment.cluster_dns_probe_target(override) == "10.0.0.53"
+    assert await override.cluster_dns_probe_target() == "10.0.0.53"
 
     cluster.service_dns_ip = None
     unavailable = _environment(tmp_path / "missing", cluster)
     with pytest.raises(RuntimeError, match="cluster_dns_ip"):
-        KubernetesEnvironment.cluster_dns_probe_target(unavailable)
+        await unavailable.cluster_dns_probe_target()
+
+
+async def test_off_cluster_dns_service_lookup_runs_off_the_event_loop(
+    tmp_path: Path,
+) -> None:
+    class ThreadRecordingCluster(FakeCluster):
+        def __init__(self) -> None:
+            super().__init__()
+            self.service_read_thread_ids: list[int] = []
+
+        @override
+        def read_namespaced_service(
+            self, name: str, namespace: str
+        ) -> k8s_client.V1Service:
+            self.service_read_thread_ids.append(threading.get_ident())
+            return super().read_namespaced_service(name, namespace)
+
+    cluster = ThreadRecordingCluster()
+    environment = _environment(tmp_path, cluster)
+
+    assert await environment.cluster_dns_probe_target() == "10.96.0.10"
+    assert cluster.service_read_thread_ids != [threading.get_ident()]
 
 
 async def test_missing_cilium_refuses_a_restricted_trial_before_creating_its_pod(

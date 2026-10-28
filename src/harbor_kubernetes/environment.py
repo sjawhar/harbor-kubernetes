@@ -578,7 +578,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 f"{self.type()} boots prebuilt images only and cannot force a build"
             )
         if self._requires_dns_probe():
-            await self._prepare_dns_probe_target()
+            await self._dns_probe_target()
         await self._apply_policy_object(self.network_policy)
         await self._create_pod()
         self._pod_started = True
@@ -637,7 +637,7 @@ class KubernetesEnvironment(BaseEnvironment):
     @override
     async def _apply_network_policy(self, network_policy: NetworkPolicy) -> None:
         if network_policy.network_mode == NetworkMode.NO_NETWORK:
-            await self._prepare_dns_probe_target()
+            await self._dns_probe_target()
         await self._apply_policy_object(network_policy)
         if self._pod_started and network_policy.network_mode == NetworkMode.NO_NETWORK:
             await self._wait_for_egress_closed()
@@ -878,12 +878,12 @@ class KubernetesEnvironment(BaseEnvironment):
             for policy in (self.network_policy, *self._phase_network_policies)
         )
 
-    async def _prepare_dns_probe_target(self) -> None:
+    async def _dns_probe_target(self) -> str:
         if self._cluster_dns_target is None:
-            await self._apis()
-            self._cluster_dns_target = self.cluster_dns_probe_target()
+            self._cluster_dns_target = await self.cluster_dns_probe_target()
+        return self._cluster_dns_target
 
-    def cluster_dns_probe_target(self) -> str:
+    async def cluster_dns_probe_target(self) -> str:
         """Return the cluster DNS address used by no-network convergence probes."""
         if self.cluster_dns_ip is not None:
             return _validated_cluster_dns_ip(self.cluster_dns_ip)
@@ -906,26 +906,18 @@ class KubernetesEnvironment(BaseEnvironment):
                 f"no non-loopback nameserver in {RUNNER_RESOLV_CONF}; cannot target the "
                 + "cluster DNS for the no-network convergence probe"
             )
-        if self._connected_apis is None:
-            raise RuntimeError(
-                "cannot read the kube-system/kube-dns Service before cluster access is "
-                + "configured; set cluster_dns_ip explicitly."
-            )
+        apis = await self._apis()
         try:
-            service_result = self._connected_apis.pods.read_namespaced_service(
-                name="kube-dns", namespace="kube-system"
+            service = await asyncio.to_thread(
+                apis.pods.read_namespaced_service,
+                name="kube-dns",
+                namespace="kube-system",
             )
         except k8s_client.ApiException as error:
             raise RuntimeError(
                 "cannot read the kube-system/kube-dns Service for the no-network "
                 + "convergence probe; set cluster_dns_ip explicitly."
             ) from error
-        if not isinstance(service_result, k8s_client.V1Service):
-            raise RuntimeError(
-                "the kube-system/kube-dns Service returned an invalid object; set "
-                + "cluster_dns_ip explicitly."
-            )
-        service = service_result
         cluster_ip = None if service.spec is None else service.spec.cluster_ip
         if cluster_ip:
             return _validated_cluster_dns_ip(cluster_ip)
@@ -935,13 +927,7 @@ class KubernetesEnvironment(BaseEnvironment):
         )
 
     async def _wait_for_egress_closed(self) -> None:
-        await self._prepare_dns_probe_target()
-        target = self._cluster_dns_target
-        if target is None:
-            raise RuntimeError(
-                "cluster_dns_ip is required for the no-network convergence probe"
-            )
-        probe_command = egress_probe(target)
+        probe_command = egress_probe(await self._dns_probe_target())
         deadline = time.monotonic() + self.POLICY_CONVERGE_TIMEOUT_SEC
         agreeing = 0
         observed = "(never probed)"
