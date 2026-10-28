@@ -1085,8 +1085,8 @@ async def test_missing_namespace_status_body_reraises_the_original_api_exception
 ) -> None:
     error = _not_found_with_body(
         '{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",'
-        '"message":"namespaces \\"no-such-ns\\" not found","reason":"NotFound",'
-        '"details":{"name":"no-such-ns","kind":"namespaces"},"code":404}'
+        + '"message":"namespaces \\"no-such-ns\\" not found","reason":"NotFound",'
+        + '"details":{"name":"no-such-ns","kind":"namespaces"},"code":404}'
     )
     cluster = FakeCluster(cilium_create_error=error)
     environment = _environment(tmp_path, cluster, baseline=NetworkMode.NO_NETWORK)

@@ -125,28 +125,19 @@ def _cluster_dns_ip(core_api: k8s_client.CoreV1Api) -> str:
 def _read_namespace(
     core_api: k8s_client.CoreV1Api, namespace: str
 ) -> k8s_client.V1Namespace:
-    result = core_api.read_namespace(namespace)
-    if not isinstance(result, k8s_client.V1Namespace):
-        raise RuntimeError(f"read_namespace returned {type(result).__name__}")
-    return result
+    return core_api.read_namespace(namespace)
 
 
 def _read_service(
     core_api: k8s_client.CoreV1Api, name: str, namespace: str
 ) -> k8s_client.V1Service:
-    result = core_api.read_namespaced_service(name, namespace)
-    if not isinstance(result, k8s_client.V1Service):
-        raise RuntimeError(f"read_namespaced_service returned {type(result).__name__}")
-    return result
+    return core_api.read_namespaced_service(name, namespace)
 
 
 def _read_pod(
     core_api: k8s_client.CoreV1Api, name: str, namespace: str
 ) -> k8s_client.V1Pod:
-    result = core_api.read_namespaced_pod(name, namespace)
-    if not isinstance(result, k8s_client.V1Pod):
-        raise RuntimeError(f"read_namespaced_pod returned {type(result).__name__}")
-    return result
+    return core_api.read_namespaced_pod(name, namespace)
 
 
 def _preflight_image_pull(core_api: k8s_client.CoreV1Api, namespace: str) -> None:
@@ -182,7 +173,7 @@ def _preflight_image_pull(core_api: k8s_client.CoreV1Api, namespace: str) -> Non
                 if waiting is not None and waiting.reason in _IMAGE_PULL_FAILURES:
                     pytest.fail(
                         f"staging cannot pull {_IMAGE}: {waiting.reason}: "
-                        f"{waiting.message or 'no message'}"
+                        + f"{waiting.message or 'no message'}"
                     )
             if (
                 status is not None
@@ -198,7 +189,7 @@ def _preflight_image_pull(core_api: k8s_client.CoreV1Api, namespace: str) -> Non
             }:
                 pytest.fail(
                     f"staging cannot pull {_IMAGE}: pod ended {status.phase}: "
-                    f"{status.message or status.reason or 'no reason'}"
+                    + f"{status.message or status.reason or 'no reason'}"
                 )
             if time.monotonic() >= deadline:
                 pytest.fail(
@@ -228,7 +219,7 @@ def _delete_pod_and_wait(
         if time.monotonic() >= deadline:
             raise AssertionError(
                 f"image pull preflight pod {pod_name} was not deleted within "
-                f"{_POD_DELETE_TIMEOUT_SEC}s"
+                + f"{_POD_DELETE_TIMEOUT_SEC}s"
             )
         time.sleep(_POLL_INTERVAL_SEC)
 
@@ -252,6 +243,6 @@ def _delete_namespace_and_wait(core_api: k8s_client.CoreV1Api, namespace: str) -
         if time.monotonic() >= deadline:
             raise AssertionError(
                 f"scratch namespace {namespace} was not deleted within "
-                f"{_NAMESPACE_DELETE_TIMEOUT_SEC}s"
+                + f"{_NAMESPACE_DELETE_TIMEOUT_SEC}s"
             )
         time.sleep(_POLL_INTERVAL_SEC)

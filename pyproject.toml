@@ -50,13 +50,14 @@ dev = [
     "ruff>=0.16.5",
 ]
 
-[tool.pyright]
-typeCheckingMode = "basic"
+[tool.basedpyright]
+typeCheckingMode = "recommended"
+failOnWarnings = true
 reportAny = false
 reportExplicitAny = false
-reportMissingModuleSource = false
 reportMissingTypeStubs = false
 reportUnusedCallResult = false
+stubPath = "typings"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

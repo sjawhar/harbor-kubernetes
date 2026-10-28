@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Protocol, Required, TypedDict, Unpack, cast, override
+from typing import Final, Protocol, Required, TypeGuard, TypedDict, Unpack, override
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.capabilities import (
@@ -70,15 +70,15 @@ from harbor_kubernetes.transport import (
     return_code,
 )
 
-ENVIRONMENT_TYPE = "kubernetes"
-CONTAINER_NAME = "main"
-DEFAULT_IMAGE_PULL_POLICY = "IfNotPresent"
-DEFAULT_POD_READY_TIMEOUT_SEC = 900.0
-LOOPBACK_NAMESERVER = "127.0.0.1"
-RUNNER_RESOLV_CONF = Path("/etc/resolv.conf")
-K8S_NAME_MAX_LENGTH = 63
-COMPOSE_FILE_NAME = "docker-compose.yaml"
-POD_START_FAILURES = frozenset(
+ENVIRONMENT_TYPE: Final = "kubernetes"
+CONTAINER_NAME: Final = "main"
+DEFAULT_IMAGE_PULL_POLICY: Final = "IfNotPresent"
+DEFAULT_POD_READY_TIMEOUT_SEC: Final = 900.0
+LOOPBACK_NAMESERVER: Final = "127.0.0.1"
+RUNNER_RESOLV_CONF: Final = Path("/etc/resolv.conf")
+K8S_NAME_MAX_LENGTH: Final = 63
+COMPOSE_FILE_NAME: Final = "docker-compose.yaml"
+POD_START_FAILURES: Final[frozenset[str]] = frozenset(
     {
         "ErrImagePull",
         "ImagePullBackOff",
@@ -89,6 +89,10 @@ POD_START_FAILURES = frozenset(
 )
 
 
+def _object_mapping(value: object) -> TypeGuard[dict[str, object]]:
+    return isinstance(value, dict)
+
+
 def _is_namespace_not_found(error: k8s_client.ApiException) -> bool:
     """Whether a 404 body is Kubernetes' JSON Status for a missing namespace."""
     if error.status != 404 or not isinstance(error.body, str):
@@ -97,10 +101,10 @@ def _is_namespace_not_found(error: k8s_client.ApiException) -> bool:
         document: object = json.loads(error.body)
     except json.JSONDecodeError:
         return False
-    if not isinstance(document, dict) or document.get("kind") != "Status":
+    if not _object_mapping(document) or document.get("kind") != "Status":
         return False
     details = document.get("details")
-    return isinstance(details, dict) and details.get("kind") == "namespaces"
+    return _object_mapping(details) and details.get("kind") == "namespaces"
 
 
 class KubernetesEnvironmentKwargs(TypedDict, total=False):
@@ -214,12 +218,12 @@ class CiliumPolicyApi(Protocol):
 
 def _resource_version(live: object) -> str:
     """Return a Cilium object's resource version or reject an invalid API response."""
-    if not isinstance(live, Mapping):
+    if not _object_mapping(live):
         raise RuntimeError(
             f"live {CILIUM_POLICY_KIND} carries no metadata.resourceVersion"
         )
     metadata = live.get("metadata")
-    if not isinstance(metadata, Mapping):
+    if not _object_mapping(metadata):
         raise RuntimeError(
             f"live {CILIUM_POLICY_KIND} carries no metadata.resourceVersion"
         )
@@ -285,14 +289,14 @@ class KubernetesEnvironment(BaseEnvironment):
     trial with network rules gets a CiliumNetworkPolicy, so it requires Cilium.
     """
 
-    POLL_INTERVAL_SEC = 1.0
-    POLICY_PROBE_INTERVAL_SEC = 2.0
-    POLICY_CONVERGE_TIMEOUT_SEC = 60.0
-    POD_DELETE_TIMEOUT_SEC = 60.0
+    POLL_INTERVAL_SEC: float = 1.0
+    POLICY_PROBE_INTERVAL_SEC: float = 2.0
+    POLICY_CONVERGE_TIMEOUT_SEC: float = 60.0
+    POD_DELETE_TIMEOUT_SEC: float = 60.0
     # Whole-object policy replacements retry after a concurrent status update changes
     # the resource version between the read and replace.
-    POLICY_REPLACE_ATTEMPTS = 5
-    EXEC_READY_ATTEMPTS = 60
+    POLICY_REPLACE_ATTEMPTS: int = 5
+    EXEC_READY_ATTEMPTS: int = 60
 
     def __init__(
         self,
@@ -314,28 +318,27 @@ class KubernetesEnvironment(BaseEnvironment):
         allow_public_network: bool = True,
         cluster_dns_ip: str | None = None,
         apis: KubernetesApis | None = None,
-        **kwargs: Unpack[KubernetesEnvironmentInitKwargs],
+        **kwargs: Unpack[BaseEnvironmentKwargs],
     ) -> None:
         if not namespace:
             raise ValueError("namespace must name the namespace trial pods run in")
-        self.namespace = namespace
-        self.kube_context = kube_context
-        self.runtime_class_name = runtime_class_name
-        self.pod_labels = validated_pod_labels(pod_labels)
-        self.annotations = dict(annotations or {})
-        self.image_pull_policy = image_pull_policy
-        self.pod_ready_timeout_sec = pod_ready_timeout_sec
-        self.ephemeral_storage_request = ephemeral_storage_request
-        self.ephemeral_storage_limit = ephemeral_storage_limit
-        self.allow_public_network = allow_public_network
-        self.cluster_dns_ip = cluster_dns_ip
-        self.pod_name = _k8s_name(session_id)
-        self.network_policy_name = f"{self.pod_name}-sandbox-egress"
-        self._apis_lock = asyncio.Lock()
+        self.namespace: str = namespace
+        self.kube_context: str | None = kube_context
+        self.runtime_class_name: str | None = runtime_class_name
+        self.pod_labels: dict[str, str] = validated_pod_labels(pod_labels)
+        self.annotations: dict[str, str] = dict(annotations or {})
+        self.image_pull_policy: str = image_pull_policy
+        self.pod_ready_timeout_sec: float = pod_ready_timeout_sec
+        self.ephemeral_storage_request: str | None = ephemeral_storage_request
+        self.ephemeral_storage_limit: str | None = ephemeral_storage_limit
+        self.allow_public_network: bool = allow_public_network
+        self.cluster_dns_ip: str | None = cluster_dns_ip
+        self.pod_name: str = _k8s_name(session_id)
+        self.network_policy_name: str = f"{self.pod_name}-sandbox-egress"
+        self._apis_lock: asyncio.Lock = asyncio.Lock()
         self._connected_apis: KubernetesApis | None = apis
-        self._pod_started = False
+        self._pod_started: bool = False
         self._pod_owner: OwnerReference | None = None
-
         self._cluster_dns_target: str | None = None
         super().__init__(
             environment_dir=environment_dir,
@@ -398,7 +401,7 @@ class KubernetesEnvironment(BaseEnvironment):
         if (self.environment_dir / COMPOSE_FILE_NAME).exists():
             raise ValueError(
                 f"{self.type()} runs one container per trial; this task defines a "
-                f"compose environment ({self.environment_dir / COMPOSE_FILE_NAME})."
+                + f"compose environment ({self.environment_dir / COMPOSE_FILE_NAME})."
             )
         if not self.task_env_config.docker_image:
             raise ValueError(
@@ -445,10 +448,8 @@ class KubernetesEnvironment(BaseEnvironment):
             )
 
         return KubernetesApis(
-            pods=cast(PodApi, k8s_client.CoreV1Api(rest_client)),
-            cilium_policies=cast(
-                CiliumPolicyApi, k8s_client.CustomObjectsApi(rest_client)
-            ),
+            pods=k8s_client.CoreV1Api(rest_client),
+            cilium_policies=k8s_client.CustomObjectsApi(rest_client),
             open_exec=open_exec,
         )
 
@@ -760,9 +761,12 @@ class KubernetesEnvironment(BaseEnvironment):
                 name=self.pod_name,
                 namespace=self.namespace,
             )
+            existing_metadata = existing.metadata
             owner = (
-                cast(k8s_client.V1ObjectMeta, existing.metadata).annotations or {}
-            ).get(SESSION_ID_ANNOTATION)
+                None
+                if existing_metadata is None
+                else (existing_metadata.annotations or {}).get(SESSION_ID_ANNOTATION)
+            )
             if owner != self.session_id:
                 raise RuntimeError(
                     f"Pod {self.pod_name} already exists for Harbor session {owner!r}, "
@@ -781,7 +785,8 @@ class KubernetesEnvironment(BaseEnvironment):
             created = await asyncio.to_thread(
                 apis.pods.create_namespaced_pod, namespace=self.namespace, body=pod
             )
-        uid = cast(k8s_client.V1ObjectMeta, created.metadata).uid
+        created_metadata = created.metadata
+        uid = None if created_metadata is None else created_metadata.uid
         if not uid:
             raise RuntimeError(
                 f"The API server created pod {self.pod_name} but returned no uid for it, "
@@ -822,8 +827,8 @@ class KubernetesEnvironment(BaseEnvironment):
         deadline = time.monotonic() + self.pod_ready_timeout_sec
         while True:
             pod = await self._read_pod()
-            if pod is not None:
-                status = cast(k8s_client.V1PodStatus, pod.status)
+            if pod is not None and pod.status is not None:
+                status = pod.status
                 container_statuses = status.container_statuses or []
                 if (
                     status.phase == "Running"

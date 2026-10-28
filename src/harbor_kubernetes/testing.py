@@ -16,7 +16,6 @@ from harbor_kubernetes.environment import KubernetesApis, KubernetesEnvironment
 from harbor_kubernetes.network_policy import (
     CiliumNetworkPolicyManifest,
     CiliumPolicyOwnerPatch,
-    SESSION_ID_ANNOTATION,
 )
 
 __all__ = [
@@ -46,13 +45,13 @@ class FakeExecStream:
     """A Kubernetes exec websocket that runs the provider's shell protocol locally."""
 
     def __init__(self, argv: list[str], answer: Answer | None) -> None:
-        self.argv = argv
-        self.answer = answer
-        self.stdin = bytearray()
-        self.open = True
+        self.argv: list[str] = argv
+        self.answer: Answer | None = answer
+        self.stdin: bytearray = bytearray()
+        self.open: bool = True
         self.channels: dict[int, bytes] = {}
         self.status: int | None = None
-        self.pings = 0
+        self.pings: int = 0
 
     @property
     def sock(self) -> FakeExecStream:
@@ -136,15 +135,15 @@ class FakeCluster:
         self.policies: dict[str, CiliumNetworkPolicyManifest] = {}
         self.resource_versions: dict[str, int] = {}
         self.status_writes_pending: dict[str, int] = {}
-        self.status_writes = 0
-        self._cilium_reports_status = cilium_reports_status
+        self.status_writes: int = 0
+        self._cilium_reports_status: bool = cilium_reports_status
         self.calls: list[tuple[str, str]] = []
         self.pod_deletions: list[k8s_client.V1DeleteOptions | None] = []
-        self.egress_closes_after = egress_closes_after
-        self.probes = 0
-        self.waiting_reason = waiting_reason
-        self.cilium_enabled = True
-        self.cilium_create_error = cilium_create_error
+        self.egress_closes_after: int = egress_closes_after
+        self.probes: int = 0
+        self.waiting_reason: str | None = waiting_reason
+        self.cilium_enabled: bool = True
+        self.cilium_create_error: k8s_client.ApiException | None = cilium_create_error
         self.service_dns_ip: str | None = "10.96.0.10"
 
     def create_namespaced_pod(

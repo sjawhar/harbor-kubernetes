@@ -138,7 +138,7 @@ def validated_pod_labels(pod_labels: Mapping[str, str] | None) -> dict[str, str]
     if SESSION_LABEL in labels:
         raise ValueError(
             f"pod_labels may not set {SESSION_LABEL!r}: the provider owns it, and the "
-            "trial's network policy selects the pod by it."
+            + "trial's network policy selects the pod by it."
         )
     return labels
 
@@ -222,12 +222,16 @@ def build_network_policy_manifest(
                     cidrs.append(f"{address}/{32 if address.version == 4 else 128}")
             spec = {
                 "description": (
-                    "Harbor trial, allowlist: ingress from the trial's own pod; "
-                    "egress to cluster DNS for this namespace, the trial's own pod, "
-                    "and the allowlisted CIDRs."
+                    (
+                        "Harbor trial, allowlist: ingress from the trial's own pod; "
+                        + "egress to cluster DNS for this namespace, the trial's own pod, "
+                        + "and the allowlisted CIDRs."
+                    )
                     if cidrs
-                    else "Harbor trial, granted nothing: ingress from the trial's own "
-                    "pod; egress to cluster DNS for this namespace and the trial's own pod."
+                    else (
+                        "Harbor trial, granted nothing: ingress from the trial's own "
+                        + "pod; egress to cluster DNS for this namespace and the trial's own pod."
+                    )
                 ),
                 "endpointSelector": selector,
                 "ingress": _sandbox_ingress_rules(selector),
