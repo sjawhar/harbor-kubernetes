@@ -101,11 +101,13 @@ def test_policy_observer_watches_from_the_initial_list_resource_version() -> Non
             "namespace": "scratch",
             "plural": "ciliumnetworkpolicies",
             "resource_version": "42",
+            "timeout_seconds": 2,
         }
     ]
 
 
-def test_a_policy_watch_that_ends_before_stop_fails_the_observation() -> None:
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_policy_watch_that_dies_before_stop_fails_the_observation() -> None:
     class ListingApi(k8s_client.CustomObjectsApi):
         @override
         def list_namespaced_custom_object(
@@ -118,8 +120,8 @@ def test_a_policy_watch_that_ends_before_stop_fails_the_observation() -> None:
             del group, version, namespace, plural
             return {"metadata": {"resourceVersion": "42"}, "items": []}
 
-    class EndingWatch(k8s_watch.Watch):
-        """A watch stream that ends on its own, before the run stops it."""
+    class FailingWatch(k8s_watch.Watch):
+        """A watch whose connection fails with an error the observer does not catch."""
 
         @override
         def stream(
@@ -129,14 +131,18 @@ def test_a_policy_watch_that_ends_before_stop_fails_the_observation() -> None:
             **kwargs: object,
         ) -> Iterator[dict[str, object]]:
             del func, args, kwargs
-            yield from ()
+
+            def reset_connection() -> dict[str, object]:
+                raise ConnectionResetError("connection reset by peer")
+
+            return iter(reset_connection, {})
 
         @override
         def stop(self) -> None:
             return None
 
     observer = test_harbor_run.CiliumPolicyObserver(
-        ListingApi(), "scratch", EndingWatch()
+        ListingApi(), "scratch", FailingWatch()
     )
     observer.start()
 

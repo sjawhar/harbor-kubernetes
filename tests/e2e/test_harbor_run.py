@@ -24,6 +24,9 @@ from harbor_kubernetes.network_policy import (
 _IMAGE: Final = "python:3.13-slim"
 _HARBOR_RUN_TIMEOUT_SEC: Final = 300
 _WATCH_READY_TIMEOUT_SEC: Final = 10
+# A watch round ends server-side after this long, so the thread sees a stop request
+# within it; each round resumes from the last event's resourceVersion, so none is missed.
+_WATCH_ROUND_SEC: Final = 2
 
 
 class E2ECluster(Protocol):
@@ -104,21 +107,27 @@ class CiliumPolicyObserver:
                 _policy_list(self._custom_objects_api, self._namespace)
             )
             self._ready.set()
-            for event in self._watch.stream(
-                self._custom_objects_api.list_namespaced_custom_object,
-                group=CILIUM_POLICY_GROUP,
-                version=CILIUM_POLICY_VERSION,
-                namespace=self._namespace,
-                plural=CILIUM_POLICY_PLURAL,
-                resource_version=resource_version,
-            ):
-                if self._stop.is_set():
-                    return
-                if event.get("type") != "ADDED":
-                    continue
-                name = _policy_name(event.get("object"))
-                if name is not None:
-                    self._names.add(name)
+            while not self._stop.is_set():
+                for event in self._watch.stream(
+                    self._custom_objects_api.list_namespaced_custom_object,
+                    group=CILIUM_POLICY_GROUP,
+                    version=CILIUM_POLICY_VERSION,
+                    namespace=self._namespace,
+                    plural=CILIUM_POLICY_PLURAL,
+                    resource_version=resource_version,
+                    timeout_seconds=_WATCH_ROUND_SEC,
+                ):
+                    if self._stop.is_set():
+                        return
+                    resource_version = (
+                        _object_resource_version(event.get("raw_object"))
+                        or resource_version
+                    )
+                    if event.get("type") != "ADDED":
+                        continue
+                    name = _policy_name(event.get("object"))
+                    if name is not None:
+                        self._names.add(name)
         except (k8s_client.ApiException, RuntimeError) as error:
             self._error = error
             self._ready.set()
@@ -146,6 +155,16 @@ def _policy_name(value: object) -> str | None:
         return None
     name = metadata.get("name")
     return name if isinstance(name, str) else None
+
+
+def _object_resource_version(value: object) -> str | None:
+    if not _object_mapping(value):
+        return None
+    metadata = value.get("metadata")
+    if not _object_mapping(metadata):
+        return None
+    resource_version = metadata.get("resourceVersion")
+    return resource_version if isinstance(resource_version, str) else None
 
 
 @pytest.mark.e2e
