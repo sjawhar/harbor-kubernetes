@@ -9,9 +9,11 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Final, Protocol, TypeGuard
 
 import pytest
 from kubernetes import client as k8s_client
+from kubernetes import watch as k8s_watch
 
 from harbor_kubernetes.network_policy import (
     CILIUM_POLICY_GROUP,
@@ -19,9 +21,18 @@ from harbor_kubernetes.network_policy import (
     CILIUM_POLICY_VERSION,
 )
 
-_IMAGE = "python:3.13-slim"
-_POLICY_POLL_INTERVAL_SEC = 0.2
-_HARBOR_RUN_TIMEOUT_SEC = 300
+_IMAGE: Final = "python:3.13-slim"
+_HARBOR_RUN_TIMEOUT_SEC: Final = 300
+_WATCH_READY_TIMEOUT_SEC: Final = 10
+
+
+class E2ECluster(Protocol):
+    """Live-cluster fixture fields used by the plain-Harbor proof."""
+
+    kube_context: str
+    namespace: str
+    cluster_dns_ip: str
+    custom_objects_api: k8s_client.CustomObjectsApi
 
 
 @dataclass(frozen=True)
@@ -34,51 +45,100 @@ class HarborRun:
 
 
 class CiliumPolicyObserver:
-    """Record policies seen while a single Harbor trial runs in its namespace."""
+    """Record Cilium policies added after a resource-versioned initial list."""
 
     def __init__(
-        self, custom_objects_api: k8s_client.CustomObjectsApi, namespace: str
+        self,
+        custom_objects_api: k8s_client.CustomObjectsApi,
+        namespace: str,
+        watch: k8s_watch.Watch | None = None,
     ) -> None:
-        self._custom_objects_api = custom_objects_api
-        self._namespace = namespace
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._custom_objects_api: k8s_client.CustomObjectsApi = custom_objects_api
+        self._namespace: str = namespace
+        self._stop: threading.Event = threading.Event()
+        self._ready: threading.Event = threading.Event()
+        self._watch: k8s_watch.Watch = k8s_watch.Watch() if watch is None else watch
+        self._thread: threading.Thread = threading.Thread(
+            target=self._watch_policies, daemon=True
+        )
         self._names: set[str] = set()
-        self._error: k8s_client.ApiException | RuntimeError | None = None
+        self._error: Exception | None = None
 
     def start(self) -> None:
-        """Begin recording CiliumNetworkPolicy names."""
+        """Begin watching after the initial list's resource version is established."""
         self._thread.start()
+        if not self._ready.wait(_WATCH_READY_TIMEOUT_SEC):
+            self._stop.set()
+            self._watch.stop()
+            self._thread.join(timeout=_WATCH_READY_TIMEOUT_SEC)
+            raise RuntimeError("Cilium policy observer did not establish its watch")
+        if self._error is not None:
+            raise self._error
 
     def stop(self) -> frozenset[str]:
-        """Stop recording and return every policy name that was observed."""
+        """Stop recording and return every policy name that was added."""
         self._stop.set()
-        self._thread.join(timeout=10)
+        self._watch.stop()
+        self._thread.join(timeout=_WATCH_READY_TIMEOUT_SEC)
         if self._thread.is_alive():
             raise RuntimeError("Cilium policy observer did not stop")
         if self._error is not None:
             raise self._error
         return frozenset(self._names)
 
-    def _poll(self) -> None:
+    def _watch_policies(self) -> None:
         try:
-            while not self._stop.is_set():
-                for item in _policy_items(self._custom_objects_api, self._namespace):
-                    metadata = item.get("metadata")
-                    if not isinstance(metadata, dict):
-                        continue
-                    name = metadata.get("name")
-                    if isinstance(name, str):
-                        self._names.add(name)
-                self._stop.wait(_POLICY_POLL_INTERVAL_SEC)
-        except (k8s_client.ApiException, RuntimeError) as error:
+            resource_version = _resource_version(
+                _policy_list(self._custom_objects_api, self._namespace)
+            )
+            self._ready.set()
+            for event in self._watch.stream(
+                self._custom_objects_api.list_namespaced_custom_object,
+                group=CILIUM_POLICY_GROUP,
+                version=CILIUM_POLICY_VERSION,
+                namespace=self._namespace,
+                plural=CILIUM_POLICY_PLURAL,
+                resource_version=resource_version,
+            ):
+                if self._stop.is_set():
+                    return
+                if event.get("type") != "ADDED":
+                    continue
+                name = _policy_name(event.get("object"))
+                if name is not None:
+                    self._names.add(name)
+        except Exception as error:
             self._error = error
-            self._stop.set()
+            self._ready.set()
+
+
+def _object_mapping(value: object) -> TypeGuard[dict[str, object]]:
+    return isinstance(value, dict)
+
+
+def _resource_version(policy_list: dict[str, object]) -> str:
+    metadata = policy_list.get("metadata")
+    if not _object_mapping(metadata):
+        raise RuntimeError("Cilium policy list has no metadata.resourceVersion")
+    resource_version = metadata.get("resourceVersion")
+    if not isinstance(resource_version, str):
+        raise RuntimeError("Cilium policy list has no metadata.resourceVersion")
+    return resource_version
+
+
+def _policy_name(value: object) -> str | None:
+    if not _object_mapping(value):
+        return None
+    metadata = value.get("metadata")
+    if not _object_mapping(metadata):
+        return None
+    name = metadata.get("name")
+    return name if isinstance(name, str) else None
 
 
 @pytest.mark.e2e
 def test_public_harbor_run_never_creates_a_cilium_network_policy(
-    e2e_cluster, tmp_path: Path
+    e2e_cluster: E2ECluster, tmp_path: Path
 ) -> None:
     """Harbor's default public task completes without a Cilium policy."""
     run = _run_harbor(e2e_cluster, tmp_path, network_mode="public")
@@ -91,7 +151,7 @@ def test_public_harbor_run_never_creates_a_cilium_network_policy(
 
 @pytest.mark.e2e
 def test_no_network_harbor_run_waits_for_closed_dns_and_removes_its_policy(
-    e2e_cluster, tmp_path: Path
+    e2e_cluster: E2ECluster, tmp_path: Path
 ) -> None:
     """A no-network task completes only after DNS TCP egress is closed."""
     run = _run_harbor(e2e_cluster, tmp_path, network_mode="no-network")
@@ -101,14 +161,16 @@ def test_no_network_harbor_run_waits_for_closed_dns_and_removes_its_policy(
     assert _list_policy_names(e2e_cluster) == frozenset()
     assert run.trial_result["exception_info"] is None
     environment_setup = run.trial_result["environment_setup"]
-    assert isinstance(environment_setup, dict)
+    assert _object_mapping(environment_setup)
     assert environment_setup["started_at"] is not None
     assert environment_setup["finished_at"] is not None
     print(f"no-network Harbor trial wall time: {run.elapsed_sec:.2f}s")
 
 
-def _run_harbor(e2e_cluster, tmp_path: Path, *, network_mode: str) -> HarborRun:
-    task_dir = _write_task(
+def _run_harbor(
+    e2e_cluster: E2ECluster, tmp_path: Path, *, network_mode: str
+) -> HarborRun:
+    task_dir = write_task(
         tmp_path / "task",
         network_mode=network_mode,
         cluster_dns_ip=e2e_cluster.cluster_dns_ip,
@@ -162,7 +224,7 @@ def _run_harbor(e2e_cluster, tmp_path: Path, *, network_mode: str) -> HarborRun:
     except subprocess.TimeoutExpired as error:
         raise AssertionError(
             f"harbor run for {network_mode} exceeded {_HARBOR_RUN_TIMEOUT_SEC}s: "
-            f"{error.stdout or ''}{error.stderr or ''}"
+            + f"{error.stdout or ''}{error.stderr or ''}"
         ) from error
     finally:
         policy_names = observer.stop()
@@ -177,32 +239,45 @@ def _run_harbor(e2e_cluster, tmp_path: Path, *, network_mode: str) -> HarborRun:
     )
 
 
-def _write_task(task_dir: Path, *, network_mode: str, cluster_dns_ip: str) -> Path:
+def write_task(task_dir: Path, *, network_mode: str, cluster_dns_ip: str) -> Path:
     (task_dir / "environment").mkdir(parents=True)
     (task_dir / "solution").mkdir()
     (task_dir / "tests").mkdir()
     (task_dir / "instruction.md").write_text(
         "Write the expected completion marker.\n", encoding="utf-8"
     )
-    (task_dir / "task.toml").write_text(
-        "\n".join(
+    task_toml = [
+        "[environment]",
+        f'docker_image = "{_IMAGE}"',
+        f'network_mode = "{network_mode}"',
+    ]
+    if network_mode == "no-network":
+        task_toml.extend(
             [
-                "[environment]",
-                f'docker_image = "{_IMAGE}"',
-                f'network_mode = "{network_mode}"',
                 "",
-                "[agent]",
-                "timeout_sec = 60",
-                "",
-                "[verifier]",
-                "timeout_sec = 60",
-                "",
-                "[verifier.env]",
-                f'CLUSTER_DNS_IP = "{cluster_dns_ip}"',
-                f'EXPECT_NO_NETWORK = "{"1" if network_mode == "no-network" else "0"}"',
-                "",
+                "[environment.healthcheck]",
+                f"command = {json.dumps(_no_network_healthcheck(cluster_dns_ip))}",
+                "retries = 1",
+                "timeout_sec = 5",
             ]
-        ),
+        )
+    task_toml.extend(
+        [
+            "",
+            "[agent]",
+            "timeout_sec = 60",
+            "",
+            "[verifier]",
+            "timeout_sec = 60",
+            "",
+            "[verifier.env]",
+            f'CLUSTER_DNS_IP = "{cluster_dns_ip}"',
+            f'EXPECT_NO_NETWORK = "{"1" if network_mode == "no-network" else "0"}"',
+            "",
+        ]
+    )
+    (task_dir / "task.toml").write_text(
+        "\n".join(task_toml),
         encoding="utf-8",
     )
     (task_dir / "solution" / "solve.sh").write_text(
@@ -237,40 +312,58 @@ printf '1\\n' > /logs/verifier/reward.txt
     return task_dir
 
 
-def _list_policy_names(e2e_cluster) -> frozenset[str]:
-    return frozenset(
-        name
-        for item in _policy_items(e2e_cluster.custom_objects_api, e2e_cluster.namespace)
-        if isinstance(metadata := item.get("metadata"), dict)
-        and isinstance(name := metadata.get("name"), str)
+def _no_network_healthcheck(cluster_dns_ip: str) -> str:
+    return (
+        "python -c "
+        + json.dumps(
+            "import socket; "
+            + f"socket.create_connection(({cluster_dns_ip!r}, 53), timeout=4)"
+        )
+        + " && exit 1 || exit 0"
     )
 
 
-def _policy_items(
+
+
+def _list_policy_names(e2e_cluster: E2ECluster) -> frozenset[str]:
+    policy_list = _policy_list(
+        e2e_cluster.custom_objects_api,
+        e2e_cluster.namespace,
+    )
+    return frozenset(
+        name
+        for item in _policy_items(policy_list)
+        if (name := _policy_name(item)) is not None
+    )
+
+
+def _policy_list(
     custom_objects_api: k8s_client.CustomObjectsApi, namespace: str
-) -> list[dict[str, object]]:
-    result = custom_objects_api.list_namespaced_custom_object(
+) -> dict[str, object]:
+    return custom_objects_api.list_namespaced_custom_object(
         group=CILIUM_POLICY_GROUP,
         version=CILIUM_POLICY_VERSION,
         namespace=namespace,
         plural=CILIUM_POLICY_PLURAL,
     )
-    if not isinstance(result, dict):
-        raise RuntimeError(
-            "list_namespaced_custom_object returned "
-            + f"{type(result).__name__}, not a Cilium object list"
-        )
-    items = result.get("items")
-    if not isinstance(items, list):
-        raise RuntimeError("Cilium object list did not contain an items array")
-    return [item for item in items if isinstance(item, dict)]
+
+
+def _object_list(value: object) -> TypeGuard[list[object]]:
+    return isinstance(value, list)
+
+
+def _policy_items(policy_list: dict[str, object]) -> list[dict[str, object]]:
+    raw_items = policy_list.get("items")
+    if not _object_list(raw_items):
+        raise RuntimeError("Cilium policy list did not contain an items array")
+    return [item for item in raw_items if _object_mapping(item)]
 
 
 def _trial_result(jobs_dir: Path) -> dict[str, object]:
     trial_results: list[dict[str, object]] = []
     for path in jobs_dir.glob("*/**/result.json"):
-        result = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(result, dict) and "verifier_result" in result:
+        result: object = json.loads(path.read_text(encoding="utf-8"))
+        if _object_mapping(result) and "verifier_result" in result:
             trial_results.append(result)
     assert len(trial_results) == 1
     return trial_results[0]
@@ -278,9 +371,9 @@ def _trial_result(jobs_dir: Path) -> dict[str, object]:
 
 def _reward(trial_result: dict[str, object]) -> int | float:
     verifier_result = trial_result["verifier_result"]
-    assert isinstance(verifier_result, dict)
+    assert _object_mapping(verifier_result)
     rewards = verifier_result["rewards"]
-    assert isinstance(rewards, dict)
+    assert _object_mapping(rewards)
     reward = rewards["reward"]
     assert isinstance(reward, (int, float))
     return reward

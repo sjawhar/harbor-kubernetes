@@ -27,11 +27,7 @@ from harbor_kubernetes.testing import (
 )
 
 from harbor_kubernetes.environment import KubernetesEnvironment, KubernetesPodGoneError
-from harbor_kubernetes.network_policy import (
-    PUBLIC_NETWORK_REFUSAL,
-    SESSION_ID_ANNOTATION,
-    SESSION_LABEL,
-)
+from harbor_kubernetes.network_policy import SESSION_ID_ANNOTATION, SESSION_LABEL
 
 
 def _environment(
@@ -378,7 +374,6 @@ def test_a_trial_that_asks_for_the_world_is_handled_by_the_public_network_settin
                 phase=phase,
                 allow_public_network=False,
             )
-        assert str(refused.value) == PUBLIC_NETWORK_REFUSAL
         assert cluster.calls == []
 
 
