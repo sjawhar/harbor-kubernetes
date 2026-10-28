@@ -120,7 +120,7 @@ class KubernetesEnvironmentKwargs(TypedDict, total=False):
     cluster_dns_ip: str
 
 
-class _BaseEnvironmentKwargs(TypedDict, total=False):
+class BaseEnvironmentKwargs(TypedDict, total=False):
     """The standard kwargs passed by Harbor's environment factory."""
 
     logger: logging.Logger | None
@@ -136,6 +136,12 @@ class _BaseEnvironmentKwargs(TypedDict, total=False):
     network_policy: NetworkPolicy | None
     phase_network_policies: Sequence[NetworkPolicy] | None
     extra_docker_compose: Sequence[Path | str] | None
+
+
+class KubernetesEnvironmentInitKwargs(
+    KubernetesEnvironmentKwargs, BaseEnvironmentKwargs, total=False
+):
+    """Every keyword ``KubernetesEnvironment.__init__`` accepts after Harbor's positionals."""
 
 
 class KubernetesPodGoneError(RuntimeError):
@@ -284,7 +290,7 @@ class KubernetesEnvironment(BaseEnvironment):
         ephemeral_storage_limit: str | None = None,
         allow_public_network: bool = True,
         cluster_dns_ip: str | None = None,
-        **kwargs: Unpack[_BaseEnvironmentKwargs],
+        **kwargs: Unpack[KubernetesEnvironmentInitKwargs],
     ) -> None:
         if not namespace:
             raise ValueError("namespace must name the namespace trial pods run in")
