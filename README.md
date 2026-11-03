@@ -53,12 +53,57 @@ token exists. `runtime_class_name`, labels, annotations, image-pull policy, time
 and ephemeral-storage quantities are optional pod settings.
 
 A public Harbor task creates no network-policy object. Set
-`allow_public_network: false` to reject public task phases instead. Restricted
-`no-network` and `allowlist` phases create one CiliumNetworkPolicy per trial. The
-policy is created before the pod, is updated in place for phase switches, and is
-deleted only after the pod is gone. Those modes require a cluster serving
-`ciliumnetworkpolicies.cilium.io`; the package refuses a restricted trial before it
-creates a pod when Cilium is absent. Allowlists accept only IP addresses and CIDRs.
+`allow_public_network: false` to reject public task phases instead.
+
+### Network policy backends
+
+`network_policy_backend` chooses how restricted phases are enforced.
+
+`"cilium"` (the default): restricted `no-network` and `allowlist` phases create one
+CiliumNetworkPolicy per trial. The policy is created before the pod, is updated in
+place for phase switches, and is deleted only after the pod is gone. This backend
+requires a cluster serving `ciliumnetworkpolicies.cilium.io`; the package refuses a
+restricted trial before it creates a pod when Cilium is absent. Allowlists accept only
+IP addresses and CIDRs.
+
+`"label"`: for clusters that have no namespaced CiliumNetworkPolicy, such as GKE
+Dataplane V2. The package creates no policy object. A `no-network` trial's pod is
+created with the label `harbor-no-network: "true"`, and the cluster must enforce it:
+
+- The trial namespace needs a NetworkPolicy that selects `harbor-no-network: "true"`
+  and denies all ingress and egress, DNS included.
+- No other NetworkPolicy in the namespace may allow that pod any traffic.
+  NetworkPolicies are additive, so a policy that allows egress to other trial pods
+  must exclude the label (for example with a `DoesNotExist` selector on it).
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: harbor-no-network
+  namespace: harbor-trials
+spec:
+  podSelector:
+    matchLabels:
+      harbor-no-network: "true"
+  policyTypes: [Ingress, Egress]
+---
+# Every other policy that allows trial pods traffic leaves the labelled pods out:
+spec:
+  podSelector:
+    matchExpressions:
+      - key: harbor-no-network
+        operator: DoesNotExist
+```
+
+The label backend enforces `no-network` only, so it refuses `allowlist` phases. It
+advertises no dynamic network policy, because a pod's labels fix its mode when the pod
+is created; Harbor then refuses a task whose phases switch network mode before the
+trial starts. `pod_labels` may not set `harbor-no-network` under either backend.
+
+Under both backends a `no-network` trial starts only after a probe from the pod finds
+TCP port 53 on the cluster DNS address closed, so a cluster that does not enforce the
+mode fails the trial before the agent runs.
 
 For a no-network convergence check, set `cluster_dns_ip` when the cluster DNS Service
 is not `kube-system/kube-dns`. Otherwise the environment reads the runner's resolver

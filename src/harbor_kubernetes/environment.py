@@ -16,7 +16,16 @@ from dataclasses import dataclass
 from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Final, Protocol, Required, TypedDict, TypeGuard, Unpack, override
+from typing import (
+    Final,
+    Protocol,
+    Required,
+    TypedDict,
+    TypeGuard,
+    Unpack,
+    get_args,
+    override,
+)
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.capabilities import (
@@ -43,11 +52,14 @@ from harbor_kubernetes.network_policy import (
     CILIUM_POLICY_PLURAL,
     CILIUM_POLICY_VERSION,
     DNS_PORT,
+    NO_NETWORK_LABEL,
+    NO_NETWORK_LABEL_VALUE,
     PUBLIC_NETWORK_REFUSAL,
     SESSION_ID_ANNOTATION,
     SESSION_LABEL,
     CiliumNetworkPolicyManifest,
     CiliumPolicyOwnerPatch,
+    NetworkPolicyBackend,
     OwnerReference,
     build_network_policy_manifest,
     validated_pod_labels,
@@ -120,6 +132,7 @@ class KubernetesEnvironmentKwargs(TypedDict, total=False):
     ephemeral_storage_limit: str
     allow_public_network: bool
     cluster_dns_ip: str
+    network_policy_backend: NetworkPolicyBackend
 
 
 class BaseEnvironmentKwargs(TypedDict, total=False):
@@ -284,8 +297,24 @@ class KubernetesEnvironment(BaseEnvironment):
     """Single-pod Harbor environment on any Kubernetes cluster.
 
     The environment creates a plain pod from a task's prebuilt image and executes commands
-    or transfers files over Kubernetes exec. A public trial sends no Cilium request. A
-    trial with network rules gets a CiliumNetworkPolicy, so it requires Cilium.
+    or transfers files over Kubernetes exec. A public trial sends no network-policy
+    request under either backend.
+
+    ``network_policy_backend`` chooses how a restricted trial is enforced:
+
+    - ``"cilium"`` (the default) writes one CiliumNetworkPolicy per trial before the pod
+      exists, so it requires the ``ciliumnetworkpolicies.cilium.io`` resource. It
+      enforces no-network and IP/CIDR allowlists, and switches between modes mid-trial.
+    - ``"label"`` writes no policy object. A no-network trial's pod is created with the
+      label ``harbor-no-network: "true"``, and the cluster must enforce it: the namespace
+      needs a NetworkPolicy that selects that label and denies all ingress and egress,
+      and no other NetworkPolicy may allow that pod egress (NetworkPolicies are
+      additive). It enforces no-network only, refuses allowlists, and cannot change a
+      trial's mode after start, because the mode is fixed by the pod's labels.
+
+    Under both backends a no-network trial starts only after a probe from the pod finds
+    TCP port 53 on the cluster DNS address closed, so a cluster that does not enforce
+    the mode fails the trial before it runs.
     """
 
     POLL_INTERVAL_SEC: float = 1.0
@@ -316,11 +345,20 @@ class KubernetesEnvironment(BaseEnvironment):
         ephemeral_storage_limit: str | None = None,
         allow_public_network: bool = True,
         cluster_dns_ip: str | None = None,
+        network_policy_backend: NetworkPolicyBackend = "cilium",
         apis: KubernetesApis | None = None,
         **kwargs: Unpack[BaseEnvironmentKwargs],
     ) -> None:
         if not namespace:
             raise ValueError("namespace must name the namespace trial pods run in")
+        if network_policy_backend not in get_args(NetworkPolicyBackend):
+            raise ValueError(
+                "network_policy_backend must be one of "
+                + f"{', '.join(map(repr, get_args(NetworkPolicyBackend)))}; "
+                + f"got {network_policy_backend!r}"
+            )
+        # Set before Harbor's __init__, which reads `capabilities` to validate policies.
+        self.network_policy_backend: NetworkPolicyBackend = network_policy_backend
         self.namespace: str = namespace
         self.kube_context: str | None = kube_context
         self.runtime_class_name: str | None = runtime_class_name
@@ -383,15 +421,16 @@ class KubernetesEnvironment(BaseEnvironment):
     @property
     @override
     def capabilities(self) -> EnvironmentCapabilities:
-        """Advertise the supported one-pod and Cilium network features."""
+        """Advertise the one-pod features and the network backend's enforcement."""
+        cilium = self.network_policy_backend == "cilium"
         return EnvironmentCapabilities(
             disable_internet=True,
-            network_allowlist=True,
-            network_allowlist_ipv4_addresses=True,
-            network_allowlist_ipv6_addresses=True,
-            network_allowlist_ipv4_cidrs=True,
-            network_allowlist_ipv6_cidrs=True,
-            dynamic_network_policy=True,
+            network_allowlist=cilium,
+            network_allowlist_ipv4_addresses=cilium,
+            network_allowlist_ipv6_addresses=cilium,
+            network_allowlist_ipv4_cidrs=cilium,
+            network_allowlist_ipv6_cidrs=cilium,
+            dynamic_network_policy=cilium,
             docker_compose=False,
         )
 
@@ -412,10 +451,19 @@ class KubernetesEnvironment(BaseEnvironment):
     def validate_network_policy_support(
         self, network_policy: NetworkPolicy | None = None
     ) -> None:
-        """Validate public policy support against the configured host posture."""
+        """Validate a policy against the network backend and the host posture."""
         policy = self.network_policy if network_policy is None else network_policy
         if policy.network_mode == NetworkMode.PUBLIC and not self.allow_public_network:
             raise ValueError(PUBLIC_NETWORK_REFUSAL)
+        if (
+            policy.network_mode == NetworkMode.ALLOWLIST
+            and self.network_policy_backend == "label"
+        ):
+            raise ValueError(
+                "network_mode='allowlist' is refused: network_policy_backend='label' "
+                + f"enforces no-network only, through the {NO_NETWORK_LABEL!r} pod "
+                + "label; an allowlist needs network_policy_backend='cilium'."
+            )
         super().validate_network_policy_support(network_policy)
 
     def _connect(self) -> KubernetesApis:
@@ -494,13 +542,19 @@ class KubernetesEnvironment(BaseEnvironment):
         if self.ephemeral_storage_limit is not None:
             limits["ephemeral-storage"] = self.ephemeral_storage_limit
         volumes, volume_mounts = self._image_volumes()
+        labels = {**self.pod_labels, SESSION_LABEL: self.pod_name}
+        if (
+            self.network_policy_backend == "label"
+            and self.network_policy.network_mode == NetworkMode.NO_NETWORK
+        ):
+            labels[NO_NETWORK_LABEL] = NO_NETWORK_LABEL_VALUE
         return k8s_client.V1Pod(
             api_version="v1",
             kind="Pod",
             metadata=k8s_client.V1ObjectMeta(
                 name=self.pod_name,
                 namespace=self.namespace,
-                labels={**self.pod_labels, SESSION_LABEL: self.pod_name},
+                labels=labels,
                 annotations={
                     **self.annotations,
                     SESSION_ID_ANNOTATION: self.session_id,
@@ -578,17 +632,21 @@ class KubernetesEnvironment(BaseEnvironment):
 
     @override
     async def start(self, force_build: bool) -> None:
-        """Create a policy, create the pod, and wait until exec is ready."""
+        """Enforce the network mode, create the pod, and wait until exec is ready."""
         if force_build:
             raise ValueError(
                 f"{self.type()} boots prebuilt images only and cannot force a build"
             )
         if self._requires_dns_probe():
             await self._dns_probe_target()
-        await self._apply_policy_object(self.network_policy)
+        if self.network_policy_backend == "cilium":
+            await self._apply_policy_object(self.network_policy)
         await self._create_pod()
         self._pod_started = True
-        if self.network_policy.network_mode != NetworkMode.PUBLIC:
+        if (
+            self.network_policy_backend == "cilium"
+            and self.network_policy.network_mode != NetworkMode.PUBLIC
+        ):
             await self._own_policy_object()
         await self._wait_for_pod_ready()
         await self._wait_for_exec_ready()
@@ -629,14 +687,29 @@ class KubernetesEnvironment(BaseEnvironment):
         await self._wait_for_pod_gone()
         self._pod_started = False
         self._pod_owner = None
-        if self.network_policy.network_mode != NetworkMode.PUBLIC:
+        if (
+            self.network_policy_backend == "cilium"
+            and self.network_policy.network_mode != NetworkMode.PUBLIC
+        ):
             await self._delete_policy_object()
 
     @override
     async def _apply_network_policy(self, network_policy: NetworkPolicy) -> None:
+        if (
+            self.network_policy_backend == "label"
+            and self._pod_started
+            and network_policy.network_mode != self.network_policy.network_mode
+        ):
+            raise ValueError(
+                f"network_mode={network_policy.network_mode.value!r} is refused: pod "
+                + f"{self.pod_name} was created for "
+                + f"network_mode={self.network_policy.network_mode.value!r}, and "
+                + "network_policy_backend='label' cannot change a running pod's labels."
+            )
         if network_policy.network_mode == NetworkMode.NO_NETWORK:
             await self._dns_probe_target()
-        await self._apply_policy_object(network_policy)
+        if self.network_policy_backend == "cilium":
+            await self._apply_policy_object(network_policy)
         if self._pod_started and network_policy.network_mode == NetworkMode.NO_NETWORK:
             await self._wait_for_egress_closed()
 
@@ -814,10 +887,15 @@ class KubernetesEnvironment(BaseEnvironment):
         deadline = time.monotonic() + self.POD_DELETE_TIMEOUT_SEC
         while await self._read_pod() is not None:
             if time.monotonic() >= deadline:
+                left_in_place = (
+                    f"; its {CILIUM_POLICY_KIND} {self.network_policy_name} is left "
+                    + "in place."
+                    if self.network_policy_backend == "cilium"
+                    else "."
+                )
                 raise RuntimeError(
                     f"Pod {self.pod_name} in {self.namespace} was not deleted within "
-                    + f"{self.POD_DELETE_TIMEOUT_SEC:.0f}s; its {CILIUM_POLICY_KIND} "
-                    + f"{self.network_policy_name} is left in place."
+                    + f"{self.POD_DELETE_TIMEOUT_SEC:.0f}s{left_in_place}"
                 )
             await asyncio.sleep(self.POLL_INTERVAL_SEC)
 
@@ -935,11 +1013,20 @@ class KubernetesEnvironment(BaseEnvironment):
             if agreeing >= 2:
                 return
             if time.monotonic() >= deadline:
+                enforcer = (
+                    f"{CILIUM_POLICY_KIND} {self.network_policy_name} set no-network"
+                    if self.network_policy_backend == "cilium"
+                    else f"pod {self.pod_name} was labelled "
+                    + f"{NO_NETWORK_LABEL}={NO_NETWORK_LABEL_VALUE} (namespace "
+                    + f"{self.namespace} needs a NetworkPolicy that selects that label "
+                    + "and denies all ingress and egress, and no other policy may allow "
+                    + "the pod egress)"
+                )
                 raise RuntimeError(
                     f"Egress from pod {self.pod_name} was still not closed "
-                    + f"{self.POLICY_CONVERGE_TIMEOUT_SEC:.0f}s after {CILIUM_POLICY_KIND} "
-                    + f"{self.network_policy_name} set no-network (last probe: "
-                    + f"{observed!r}); refusing to run a phase that requires it."
+                    + f"{self.POLICY_CONVERGE_TIMEOUT_SEC:.0f}s after {enforcer} "
+                    + f"(last probe: {observed!r}); refusing to run a phase that "
+                    + "requires it."
                 )
             await asyncio.sleep(self.POLICY_PROBE_INTERVAL_SEC)
 
