@@ -110,6 +110,7 @@ async def test_a_public_trial_is_an_unlabelled_pod_and_no_policy_object(
     )
 
     await environment.start(False)
+    assert _pod_labels(cluster) == {SESSION_LABEL: _POD}
     await environment.stop(delete=True)
 
     assert cluster.calls == [("create_pod", _POD), ("delete_pod", _POD)]
