@@ -719,6 +719,32 @@ async def test_uploads_use_bounded_stdin_frames(
     assert target.read_bytes() == payload
 
 
+@pytest.mark.parametrize("directory", [False, True])
+async def test_uploads_reject_short_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, directory: bool
+) -> None:
+    environment = _environment(tmp_path, FakeCluster())
+    await environment.start(False)
+    original = FakeExecStream.write_stdin
+
+    def short_write(stream: FakeExecStream, data: str | bytes) -> None:
+        original(stream, data[:-1])
+
+    monkeypatch.setattr(FakeExecStream, "write_stdin", short_write)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "data.bin").write_bytes(b"abc")
+    target = tmp_path / "pod" / "received"
+
+    # A tar missing only its last padding byte still extracts successfully.
+    # Both receivers must reject EOF before their advertised byte count.
+    with pytest.raises(RuntimeError, match="expected .* bytes, received"):
+        if directory:
+            await environment.upload_dir(source, str(target))
+        else:
+            await environment.upload_file(source / "data.bin", str(target))
+
+
 async def test_downloading_a_missing_file_raises_file_not_found(tmp_path: Path) -> None:
     environment = _environment(tmp_path, FakeCluster())
     await environment.start(False)
