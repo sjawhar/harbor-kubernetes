@@ -67,6 +67,7 @@ from harbor_kubernetes.transport import (
     decode_output,
     pack_directory,
     return_code,
+    write_stdin_frames,
 )
 
 ENVIRONMENT_TYPE: Final = "kubernetes"
@@ -963,7 +964,7 @@ class KubernetesEnvironment(BaseEnvironment):
             raise
         try:
             if stdin is not None:
-                await asyncio.to_thread(exec_stream.write_stdin, stdin)
+                await asyncio.to_thread(write_stdin_frames, exec_stream, stdin)
             collected = asyncio.to_thread(collect_output, exec_stream)
             if client_timeout_sec is None:
                 stdout, stderr = await collected

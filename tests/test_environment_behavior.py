@@ -23,7 +23,7 @@ from harbor_kubernetes.testing import POD as _POD
 from harbor_kubernetes.testing import POD_UID as _POD_UID
 from harbor_kubernetes.testing import POLICY as _POLICY
 from harbor_kubernetes.testing import SESSION as _SESSION
-from harbor_kubernetes.testing import FakeCluster, fake_environment
+from harbor_kubernetes.testing import FakeCluster, FakeExecStream, fake_environment
 from harbor_kubernetes.testing import network_policy as _policy
 
 
@@ -684,6 +684,65 @@ async def test_a_file_round_trips_byte_exact_with_its_mode(tmp_path: Path) -> No
 
     assert (tmp_path / "back" / "file.bin").read_bytes() == payload
     assert in_pod.stat().st_mode & 0o777 == 0o750
+
+
+@pytest.mark.parametrize("directory", [False, True])
+@pytest.mark.parametrize("size", [0, 1, 65535, 65536, 65537, 262400])
+async def test_uploads_use_bounded_stdin_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, directory: bool, size: int
+) -> None:
+    environment = _environment(tmp_path, FakeCluster())
+    await environment.start(False)
+    frames: list[int] = []
+    original = FakeExecStream.write_stdin
+
+    def bounded_write(stream: FakeExecStream, data: str | bytes) -> None:
+        assert len(data) <= 64 * 1024
+        frames.append(len(data))
+        original(stream, data)
+
+    monkeypatch.setattr(FakeExecStream, "write_stdin", bounded_write)
+    source = tmp_path / "source"
+    source.mkdir()
+    # Distinct full frames catch reordering or replay as well as dropped bytes.
+    payload = bytes((index + index // (64 * 1024)) % 256 for index in range(size))
+    (source / "data.bin").write_bytes(payload)
+    target = tmp_path / "pod" / "received"
+    if directory:
+        await environment.upload_dir(source, str(target))
+        target /= "data.bin"
+    else:
+        await environment.upload_file(source / "data.bin", str(target))
+
+    if size > 64 * 1024:
+        assert len(frames) > 1
+    assert target.read_bytes() == payload
+
+
+@pytest.mark.parametrize("directory", [False, True])
+async def test_uploads_reject_short_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, directory: bool
+) -> None:
+    environment = _environment(tmp_path, FakeCluster())
+    await environment.start(False)
+    original = FakeExecStream.write_stdin
+
+    def short_write(stream: FakeExecStream, data: str | bytes) -> None:
+        original(stream, data[:-1])
+
+    monkeypatch.setattr(FakeExecStream, "write_stdin", short_write)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "data.bin").write_bytes(b"abc")
+    target = tmp_path / "pod" / "received"
+
+    # A tar missing only its last padding byte still extracts successfully.
+    # Both receivers must reject EOF before their advertised byte count.
+    with pytest.raises(RuntimeError, match="expected .* bytes, received"):
+        if directory:
+            await environment.upload_dir(source, str(target))
+        else:
+            await environment.upload_file(source / "data.bin", str(target))
 
 
 async def test_downloading_a_missing_file_raises_file_not_found(tmp_path: Path) -> None:

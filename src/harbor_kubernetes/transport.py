@@ -13,11 +13,26 @@ DIRECTORY_PATH_EXIT: Final = 45
 TIMEOUT_EXIT_CODE: Final = 124
 TIMEOUT_KILL_AFTER_SEC: Final = 10
 _EXEC_KEEPALIVE_SEC: Final = 30.0
+_STDIN_FRAME_BYTES: Final = 64 * 1024
 
-UPLOAD_FILE_SCRIPT = (
-    'umask 022 && mkdir -p "$(dirname "$2")" && head -c "$1" > "$2" && chmod "$3" "$2"'
+_CHECK_UPLOAD_SIZE = (
+    'received=$(wc -c < "$upload") && '
+    'if [ "$received" -ne "$1" ]; then '
+    'printf "Upload truncated: expected %s bytes, received %s\\n" "$1" "$received" >&2; '
+    "exit 1; fi"
 )
-UPLOAD_DIR_SCRIPT = 'umask 022 && mkdir -p "$2" && head -c "$1" | tar -xf - -C "$2"'
+UPLOAD_FILE_SCRIPT = (
+    'umask 022 && mkdir -p "$(dirname "$2")" && upload=$2 && head -c "$1" > "$upload" && '
+    + _CHECK_UPLOAD_SIZE
+    + ' && chmod "$3" "$upload"'
+)
+UPLOAD_DIR_SCRIPT = (
+    'umask 022 && mkdir -p "$2" && upload=$(mktemp) && '
+    + "trap 'rm -f \"$upload\"' EXIT && "
+    + 'head -c "$1" > "$upload" && '
+    + _CHECK_UPLOAD_SIZE
+    + ' && tar -xf "$upload" -C "$2"'
+)
 DOWNLOAD_FILE_SCRIPT = (
     f'[ -e "$1" ] || exit {MISSING_PATH_EXIT}; '
     + f'[ -d "$1" ] && exit {DIRECTORY_PATH_EXIT}; '
@@ -65,6 +80,12 @@ class ExecStream(Protocol):
 def as_bytes(data: str | bytes) -> bytes:
     """Return an exec frame as bytes without corrupting binary transfers."""
     return data.encode("utf-8") if isinstance(data, str) else data
+
+
+def write_stdin_frames(exec_stream: ExecStream, data: bytes) -> None:
+    """Send bounded frames rather than one artifact-sized WebSocket frame."""
+    for offset in range(0, len(data), _STDIN_FRAME_BYTES):
+        exec_stream.write_stdin(data[offset : offset + _STDIN_FRAME_BYTES])
 
 
 def _drain(exec_stream: ExecStream, stdout: bytearray, stderr: bytearray) -> None:
