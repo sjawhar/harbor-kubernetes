@@ -13,6 +13,7 @@ DIRECTORY_PATH_EXIT: Final = 45
 TIMEOUT_EXIT_CODE: Final = 124
 TIMEOUT_KILL_AFTER_SEC: Final = 10
 _EXEC_KEEPALIVE_SEC: Final = 30.0
+_STDIN_FRAME_BYTES: Final = 64 * 1024
 
 UPLOAD_FILE_SCRIPT = (
     'umask 022 && mkdir -p "$(dirname "$2")" && head -c "$1" > "$2" && chmod "$3" "$2"'
@@ -65,6 +66,12 @@ class ExecStream(Protocol):
 def as_bytes(data: str | bytes) -> bytes:
     """Return an exec frame as bytes without corrupting binary transfers."""
     return data.encode("utf-8") if isinstance(data, str) else data
+
+
+def write_stdin_frames(exec_stream: ExecStream, data: bytes) -> None:
+    """Send bounded frames rather than one artifact-sized WebSocket frame."""
+    for offset in range(0, len(data), _STDIN_FRAME_BYTES):
+        exec_stream.write_stdin(data[offset : offset + _STDIN_FRAME_BYTES])
 
 
 def _drain(exec_stream: ExecStream, stdout: bytearray, stderr: bytearray) -> None:

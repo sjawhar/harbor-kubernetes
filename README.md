@@ -3,7 +3,8 @@
 `harbor-kubernetes` is a public [Harbor](https://github.com/harbor-framework/harbor)
 environment extension. It runs each Harbor trial as one Kubernetes pod from the task's
 `[environment].docker_image`, and carries Harbor's commands and file transfers over
-Kubernetes exec.
+Kubernetes exec. Uploads use 64 KiB stdin frames so a large artifact does not require
+the API server to accept one artifact-sized WebSocket frame.
 
 The package has no dependency on a particular Harbor host. It works with a normal
 `harbor run` from a machine that has Kubernetes credentials, as well as from a service
