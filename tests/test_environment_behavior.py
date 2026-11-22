@@ -1042,6 +1042,26 @@ def test_preflight_with_no_kubeconfig_location_says_none_was_given(
     KubernetesEnvironment.preflight()
 
 
+def test_preflight_accepts_a_kubeconfig_after_missing_and_empty_entries_or_under_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from harbor_kubernetes import environment as module
+
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current="remote-cluster"
+    )
+    monkeypatch.setattr(
+        module,
+        "KUBE_CONFIG_DEFAULT_LOCATION",
+        os.pathsep.join([str(tmp_path / "missing"), "", str(kubeconfig)]),
+    )
+    KubernetesEnvironment.preflight()
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(module, "KUBE_CONFIG_DEFAULT_LOCATION", f"~/{kubeconfig.name}")
+    KubernetesEnvironment.preflight()
+
+
 class _PodDeletionFails(FakeCluster):
     @override
     def delete_namespaced_pod(
