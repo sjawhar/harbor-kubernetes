@@ -1023,7 +1023,7 @@ def test_preflight_accepts_a_kubeconfig_and_refuses_no_credentials(
     ids=["empty", "separators-only"],
 )
 def test_preflight_with_no_kubeconfig_location_says_none_was_given(
-    monkeypatch: pytest.MonkeyPatch, location: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str
 ) -> None:
     from harbor_kubernetes import environment as module
 
@@ -1036,6 +1036,10 @@ def test_preflight_with_no_kubeconfig_location_says_none_was_given(
     assert "no kubeconfig location" in message
     assert "(looked for )" not in message
     assert "looked for" not in message
+
+    # With an in-cluster token, preflight accepts the run whatever KUBECONFIG names.
+    _with_service_account_token(tmp_path, monkeypatch)
+    KubernetesEnvironment.preflight()
 
 
 class _PodDeletionFails(FakeCluster):
