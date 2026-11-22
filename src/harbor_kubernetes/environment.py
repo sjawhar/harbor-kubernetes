@@ -277,26 +277,40 @@ def _require_kube_context(kube_context: str, location: str) -> None:
 
     The files are read the way ``load_kube_config`` reads them (same files, order, and
     merge). The refusal names the context and every file read, which the client's own
-    missing-context error does not.
+    missing-context error does not. Files the client cannot read as a kubeconfig, and a
+    location that names no file, are refused the same way.
     """
-    looked_for = ", ".join(
+    paths = [
         str(Path(path).expanduser()) for path in location.split(os.pathsep) if path
-    )
+    ]
+    if not paths:
+        raise k8s_config.ConfigException(
+            f"kube_context {kube_context!r} needs a kubeconfig, and no kubeconfig "
+            + "location was given because KUBECONFIG names no file. Set KUBECONFIG to a "
+            + "kubeconfig file, or unset it to use ~/.kube/config."
+        )
+    looked_for = ", ".join(paths)
     try:
         merger = KubeConfigMerger(location)
-    except k8s_config.ConfigException as error:
+        names = (
+            None
+            if merger.config is None
+            else {context.value["name"] for context in merger.config.value["contexts"]}
+        )
+    except Exception as error:
+        # Any error of the client's reader (YAML syntax, document shape, a directory
+        # for a file) means the files are not a kubeconfig.
         raise k8s_config.ConfigException(
             f"kube_context {kube_context!r} needs a kubeconfig, and the kubeconfig "
             + f"cannot be read (looked for {looked_for}): {error}. Correct that file, "
             + "or set KUBECONFIG."
         ) from error
-    if merger.config is None:
+    if names is None:
         raise k8s_config.ConfigException(
             f"kube_context {kube_context!r} needs a kubeconfig, and no kubeconfig file "
             + f"exists (looked for {looked_for}). Create one, or set KUBECONFIG."
         )
-    contexts = merger.config.value["contexts"]
-    if not any(context.value.get("name") == kube_context for context in contexts):
+    if kube_context not in names:
         raise k8s_config.ConfigException(
             f"kube_context {kube_context!r} is not a context of the kubeconfig "
             + f"(read {', '.join(merger.paths)}). Name a context that it defines, "

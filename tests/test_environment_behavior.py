@@ -1315,6 +1315,30 @@ def test_a_kube_context_with_no_kubeconfig_file_is_refused_naming_where_it_looke
 
 
 @pytest.mark.parametrize(
+    "location",
+    ["", os.pathsep],
+    ids=["empty", "separators-only"],
+)
+def test_a_kube_context_with_no_kubeconfig_location_is_refused_saying_none_was_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str
+) -> None:
+    from harbor_kubernetes import environment as module
+
+    _with_service_account_token(tmp_path, monkeypatch)
+    monkeypatch.setattr(module, "KUBE_CONFIG_DEFAULT_LOCATION", location)
+    loads = _record_credential_loads(monkeypatch)
+
+    with pytest.raises(k8s_config.ConfigException) as refused:
+        _connecting_environment(tmp_path, "remote-cluster").connect()
+
+    message = str(refused.value)
+    assert repr("remote-cluster") in message
+    assert "no kubeconfig location" in message
+    assert "looked for" not in message
+    assert loads == []
+
+
+@pytest.mark.parametrize(
     "content",
     [
         "apiVersion: v1\nclusters: [unclosed\n",
