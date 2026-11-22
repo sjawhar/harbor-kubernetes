@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import json
 import os
 import pwd
 import stat
@@ -14,8 +16,13 @@ import pytest
 from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor.models.trial.config import ServiceVolumeConfig
 from kubernetes import client as k8s_client
+from kubernetes import config as k8s_config
 
-from harbor_kubernetes.environment import KubernetesEnvironment, KubernetesPodGoneError
+from harbor_kubernetes.environment import (
+    KubernetesApis,
+    KubernetesEnvironment,
+    KubernetesPodGoneError,
+)
 from harbor_kubernetes.network_policy import SESSION_ID_ANNOTATION, SESSION_LABEL
 from harbor_kubernetes.testing import IMAGE as _IMAGE
 from harbor_kubernetes.testing import NAMESPACE as _NAMESPACE
@@ -61,6 +68,148 @@ def _environment(
         allow_public_network=allow_public_network,
         cluster_dns_ip=cluster_dns_ip,
     )
+
+
+@pytest.fixture(autouse=True)
+def no_service_account_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run each test off-cluster, whatever the host runs in, until it writes a token."""
+    from harbor_kubernetes import environment as module
+
+    monkeypatch.setattr(
+        module, "SERVICE_TOKEN_FILENAME", str(tmp_path / "absent-service-account-token")
+    )
+
+
+def _with_service_account_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    from harbor_kubernetes import environment as module
+
+    token = tmp_path / "service-account-token"
+    token.write_text("in-cluster", encoding="utf-8")
+    monkeypatch.setattr(module, "SERVICE_TOKEN_FILENAME", str(token))
+    return token
+
+
+def _with_kubeconfig_locations(
+    monkeypatch: pytest.MonkeyPatch, *locations: str | Path
+) -> None:
+    from harbor_kubernetes import environment as module
+
+    monkeypatch.setattr(
+        module,
+        "KUBE_CONFIG_DEFAULT_LOCATION",
+        os.pathsep.join(str(location) for location in locations),
+    )
+
+
+# A ``~`` entry the client cannot expand: no user of this name exists.
+_UNEXPANDABLE_HOME_ENTRY = "~nosuchuser12345/config"
+
+
+def _uncheckable_entry(tmp_path: Path) -> Path:
+    """Return a path in *tmp_path* whose name is too long for the file system to stat.
+
+    ``os.stat`` raises OSError (ENAMETOOLONG) for it, where the client's own reader
+    sees no file. Should the file system accept such a name, the tests that use it
+    would prove nothing, so this fails first.
+    """
+    uncheckable = tmp_path / ("k" * 300)
+    with pytest.raises(OSError) as raised:
+        os.stat(uncheckable)
+    assert raised.value.errno == errno.ENAMETOOLONG
+    return uncheckable
+
+
+def _with_runner_resolver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    content: str = "nameserver 172.20.0.10\n",
+) -> Path:
+    from harbor_kubernetes import environment as module
+
+    resolver = tmp_path / "resolv.conf"
+    resolver.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(module, "RUNNER_RESOLV_CONF", resolver)
+    return resolver
+
+
+def _write_kubeconfig(path: Path, contexts: list[str], current: str | None) -> Path:
+    """Write a kubeconfig with one cluster, user, and context per name in *contexts*."""
+    document: dict[str, object] = {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "clusters": [
+            {
+                "name": name,
+                "cluster": {
+                    "server": f"https://{name}.example:443",
+                    "certificate-authority": str(path.with_name(f"{name}-ca.crt")),
+                },
+            }
+            for name in contexts
+        ],
+        "contexts": [
+            {
+                "name": name,
+                "context": {"cluster": name, "user": name, "namespace": _NAMESPACE},
+            }
+            for name in contexts
+        ],
+        "users": [
+            {
+                "name": name,
+                "user": {
+                    "exec": {
+                        "apiVersion": "client.authentication.k8s.io/v1beta1",
+                        "command": "example-credential-helper",
+                        "args": ["token", "--cluster", name],
+                    }
+                },
+            }
+            for name in contexts
+        ],
+    }
+    if current is not None:
+        document["current-context"] = current
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def _record_credential_loads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, str | None]]:
+    """Replace both credential loaders with recorders of which one ran, and its context."""
+    loads: list[tuple[str, str | None]] = []
+
+    def load_incluster_config(**kwargs: object) -> None:
+        del kwargs
+        loads.append(("in-cluster", None))
+
+    def load_kube_config(**kwargs: object) -> None:
+        context = kwargs.get("context")
+        assert context is None or isinstance(context, str)
+        loads.append(("kubeconfig", context))
+
+    monkeypatch.setattr(k8s_config, "load_incluster_config", load_incluster_config)
+    monkeypatch.setattr(k8s_config, "load_kube_config", load_kube_config)
+    return loads
+
+
+class _ConnectingEnvironment(KubernetesEnvironment):
+    """Exposes the credential load a trial's first API call runs."""
+
+    def connect(self) -> KubernetesApis:
+        return self._connect()
+
+
+def _connecting_environment(
+    tmp_path: Path, kube_context: str | None
+) -> _ConnectingEnvironment:
+    environment = fake_environment(_ConnectingEnvironment, tmp_path, FakeCluster())
+    assert isinstance(environment, _ConnectingEnvironment)
+    environment.kube_context = kube_context
+    return environment
 
 
 async def test_start_boots_one_root_pod_carrying_the_labels_and_runtime_class(
@@ -584,17 +733,11 @@ def test_the_egress_probe_targets_an_explicit_cluster_dns_ip_not_the_pods_resolv
 async def test_the_convergence_target_is_the_runners_non_loopback_nameserver(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from harbor_kubernetes import environment as module
-
     environment = _environment(tmp_path, FakeCluster())
-    token = tmp_path / "token"
-    token.write_text("in-cluster", encoding="utf-8")
-    monkeypatch.setattr(module, "SERVICE_TOKEN_FILENAME", str(token))
-    resolver = tmp_path / "resolv.conf"
-    resolver.write_text(
-        "nameserver 127.0.0.1\nnameserver 172.20.0.10\n", encoding="utf-8"
+    _with_service_account_token(tmp_path, monkeypatch)
+    resolver = _with_runner_resolver(
+        tmp_path, monkeypatch, "nameserver 127.0.0.1\nnameserver 172.20.0.10\n"
     )
-    monkeypatch.setattr(module, "RUNNER_RESOLV_CONF", resolver)
     assert await environment.cluster_dns_probe_target() == "172.20.0.10"
 
     resolver.write_text("nameserver 127.0.0.53\n", encoding="utf-8")
@@ -883,12 +1026,129 @@ def test_preflight_accepts_a_kubeconfig_and_refuses_no_credentials(
     from harbor_kubernetes import environment as module
 
     kubeconfig = tmp_path / "kubeconfig"
-    monkeypatch.setattr(module, "SERVICE_TOKEN_FILENAME", str(tmp_path / "no"))
     monkeypatch.setattr(module, "KUBE_CONFIG_DEFAULT_LOCATION", str(kubeconfig))
     with pytest.raises(SystemExit, match="found neither"):
         KubernetesEnvironment.preflight()
 
     kubeconfig.write_text("apiVersion: v1\n", encoding="utf-8")
+    KubernetesEnvironment.preflight()
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["", os.pathsep],
+    ids=["empty", "separators-only"],
+)
+def test_preflight_with_no_kubeconfig_location_says_none_was_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str
+) -> None:
+    _with_kubeconfig_locations(monkeypatch, location)
+    with pytest.raises(SystemExit) as refused:
+        KubernetesEnvironment.preflight()
+
+    message = str(refused.value)
+    assert "found neither" in message
+    assert "no kubeconfig location" in message
+    assert "looked for" not in message
+
+    # With an in-cluster token, preflight accepts the run whatever KUBECONFIG names.
+    _with_service_account_token(tmp_path, monkeypatch)
+    KubernetesEnvironment.preflight()
+
+
+def test_preflight_accepts_a_kubeconfig_after_missing_and_empty_entries_or_under_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current="remote-cluster"
+    )
+    _with_kubeconfig_locations(monkeypatch, tmp_path / "missing", "", kubeconfig)
+    KubernetesEnvironment.preflight()
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _with_kubeconfig_locations(monkeypatch, f"~/{kubeconfig.name}")
+    KubernetesEnvironment.preflight()
+
+
+def test_preflight_skips_a_home_entry_it_cannot_expand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Should such a user ever exist, the entry would expand and this test prove nothing.
+    assert os.path.expanduser(_UNEXPANDABLE_HOME_ENTRY) == _UNEXPANDABLE_HOME_ENTRY
+    _with_kubeconfig_locations(monkeypatch, _UNEXPANDABLE_HOME_ENTRY)
+    with pytest.raises(SystemExit) as refused:
+        KubernetesEnvironment.preflight()
+
+    message = str(refused.value)
+    assert "found neither" in message
+    assert _UNEXPANDABLE_HOME_ENTRY in message
+
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current="remote-cluster"
+    )
+    _with_kubeconfig_locations(monkeypatch, _UNEXPANDABLE_HOME_ENTRY, "", kubeconfig)
+    KubernetesEnvironment.preflight()
+
+
+def test_preflight_skips_an_entry_it_cannot_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uncheckable = _uncheckable_entry(tmp_path)
+    _with_kubeconfig_locations(monkeypatch, uncheckable)
+    with pytest.raises(SystemExit) as refused:
+        KubernetesEnvironment.preflight()
+
+    message = str(refused.value)
+    assert "found neither" in message
+    assert str(uncheckable) in message
+
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current="remote-cluster"
+    )
+    _with_kubeconfig_locations(monkeypatch, uncheckable, "", kubeconfig)
+    KubernetesEnvironment.preflight()
+
+
+def test_preflight_refuses_a_kubeconfig_file_named_with_a_trailing_slash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current="remote-cluster"
+    )
+    # The client skips an entry os.path.exists rejects; should this one pass, the test
+    # would prove nothing.
+    assert not os.path.exists(f"{kubeconfig}/")
+    _with_kubeconfig_locations(monkeypatch, f"{kubeconfig}/")
+    with pytest.raises(SystemExit) as refused:
+        KubernetesEnvironment.preflight()
+
+    message = str(refused.value)
+    assert "found neither" in message
+    assert f"{kubeconfig}/" in message
+
+
+def test_preflight_reads_a_dot_before_tilde_relative_to_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    work = tmp_path / "work"
+    home.mkdir()
+    work.mkdir()
+    _write_kubeconfig(home / "config", ["remote-cluster"], current="remote-cluster")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(work)
+    _with_kubeconfig_locations(monkeypatch, "./~/config")
+    with pytest.raises(SystemExit) as refused:
+        KubernetesEnvironment.preflight()
+
+    message = str(refused.value)
+    assert "found neither" in message
+    assert "./~/config" in message
+
+    (work / "~").mkdir()
+    _write_kubeconfig(
+        work / "~" / "config", ["remote-cluster"], current="remote-cluster"
+    )
     KubernetesEnvironment.preflight()
 
 
@@ -1093,6 +1353,275 @@ async def test_off_cluster_dns_service_lookup_runs_off_the_event_loop(
 
     assert await environment.cluster_dns_probe_target() == "10.96.0.10"
     assert cluster.service_read_thread_ids != [threading.get_ident()]
+
+
+def test_an_explicit_kube_context_wins_over_the_in_cluster_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pod told to reach another cluster loads that context, not its own token."""
+    token = _with_service_account_token(tmp_path, monkeypatch)
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["other-cluster", "remote-cluster"], current=None
+    )
+    _with_kubeconfig_locations(monkeypatch, kubeconfig)
+    loads = _record_credential_loads(monkeypatch)
+    environment = _connecting_environment(tmp_path, "remote-cluster")
+
+    environment.connect()
+    assert loads == [("kubeconfig", "remote-cluster")]
+
+    token.unlink()
+    environment.connect()
+    assert loads == [("kubeconfig", "remote-cluster"), ("kubeconfig", "remote-cluster")]
+
+
+@pytest.mark.parametrize(
+    ("in_pod", "kube_context", "empty_file"),
+    [
+        (True, "absent-cluster", False),
+        (True, "", False),
+        (False, "absent-cluster", False),
+        (True, "remote-cluster", True),
+    ],
+    ids=[
+        "in-pod-missing-name",
+        "in-pod-empty-name",
+        "off-cluster-missing-name",
+        "in-pod-empty-file",
+    ],
+)
+def test_a_kube_context_the_kubeconfig_lacks_is_refused_before_any_credential_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    in_pod: bool,
+    kube_context: str,
+    empty_file: bool,
+) -> None:
+    """The refusal names the context and every kubeconfig file it read."""
+    if in_pod:
+        _with_service_account_token(tmp_path, monkeypatch)
+    if empty_file:
+        empty = tmp_path / "empty-kubeconfig"
+        empty.touch()
+        remote = _write_kubeconfig(
+            tmp_path / "remote-kubeconfig", ["remote-cluster"], current=None
+        )
+        read = [remote, empty]
+        locations = read
+    else:
+        other = _write_kubeconfig(
+            tmp_path / "other-kubeconfig", ["other-cluster"], current="other-cluster"
+        )
+        remote = _write_kubeconfig(
+            tmp_path / "remote-kubeconfig", ["remote-cluster"], current=None
+        )
+        read = [other, remote]
+        locations = [other, tmp_path / "not-there", remote]
+    _with_kubeconfig_locations(monkeypatch, *locations)
+    loads = _record_credential_loads(monkeypatch)
+    environment = _connecting_environment(tmp_path, kube_context)
+
+    with pytest.raises(k8s_config.ConfigException) as refused:
+        environment.connect()
+
+    message = str(refused.value)
+    assert repr(kube_context) in message
+    for kubeconfig in read:
+        assert str(kubeconfig) in message
+    assert loads == []
+
+
+def test_a_kube_context_with_no_kubeconfig_file_is_refused_naming_where_it_looked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _with_service_account_token(tmp_path, monkeypatch)
+    missing = tmp_path / "no-kubeconfig"
+    _with_kubeconfig_locations(monkeypatch, missing)
+    loads = _record_credential_loads(monkeypatch)
+    environment = _connecting_environment(tmp_path, "remote-cluster")
+
+    with pytest.raises(k8s_config.ConfigException) as refused:
+        environment.connect()
+
+    message = str(refused.value)
+    assert repr("remote-cluster") in message
+    assert str(missing) in message
+    assert loads == []
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["", os.pathsep],
+    ids=["empty", "separators-only"],
+)
+def test_a_kube_context_with_no_kubeconfig_location_is_refused_saying_none_was_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str
+) -> None:
+    _with_service_account_token(tmp_path, monkeypatch)
+    _with_kubeconfig_locations(monkeypatch, location)
+    loads = _record_credential_loads(monkeypatch)
+
+    with pytest.raises(k8s_config.ConfigException) as refused:
+        _connecting_environment(tmp_path, "remote-cluster").connect()
+
+    message = str(refused.value)
+    assert repr("remote-cluster") in message
+    assert "no kubeconfig location" in message
+    assert "looked for" not in message
+    assert loads == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "apiVersion: v1\nclusters: [unclosed\n",
+        "- remote-cluster\n",
+        "a-bearer-token\n",
+        "apiVersion: v1\nkind: Config\ncontexts: [remote-cluster]\n",
+        None,
+    ],
+    ids=[
+        "malformed-yaml",
+        "yaml-list",
+        "yaml-scalar",
+        "context-not-a-mapping",
+        "directory",
+    ],
+)
+def test_a_kube_context_whose_kubeconfig_is_not_a_kubeconfig_is_refused_naming_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str | None
+) -> None:
+    """A file the client cannot read as a kubeconfig holds no context either."""
+    _with_service_account_token(tmp_path, monkeypatch)
+    broken = tmp_path / "broken-kubeconfig"
+    if content is None:
+        broken.mkdir()
+    else:
+        broken.write_text(content, encoding="utf-8")
+    _with_kubeconfig_locations(monkeypatch, broken)
+    loads = _record_credential_loads(monkeypatch)
+    environment = _connecting_environment(tmp_path, "remote-cluster")
+
+    with pytest.raises(k8s_config.ConfigException) as refused:
+        environment.connect()
+
+    message = str(refused.value)
+    assert repr("remote-cluster") in message
+    assert str(broken) in message
+    assert loads == []
+
+
+def test_an_explicit_kube_context_skips_a_home_entry_it_cannot_expand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Should such a user ever exist, the entry would expand and this test prove nothing.
+    assert os.path.expanduser(_UNEXPANDABLE_HOME_ENTRY) == _UNEXPANDABLE_HOME_ENTRY
+    _with_service_account_token(tmp_path, monkeypatch)
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current=None
+    )
+    _with_kubeconfig_locations(monkeypatch, _UNEXPANDABLE_HOME_ENTRY, "", kubeconfig)
+    loads = _record_credential_loads(monkeypatch)
+
+    _connecting_environment(tmp_path, "remote-cluster").connect()
+
+    assert loads == [("kubeconfig", "remote-cluster")]
+
+
+def test_an_explicit_kube_context_skips_an_entry_it_cannot_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uncheckable = _uncheckable_entry(tmp_path)
+    _with_service_account_token(tmp_path, monkeypatch)
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current=None
+    )
+    _with_kubeconfig_locations(monkeypatch, uncheckable, "", kubeconfig)
+    loads = _record_credential_loads(monkeypatch)
+
+    _connecting_environment(tmp_path, "remote-cluster").connect()
+
+    assert loads == [("kubeconfig", "remote-cluster")]
+
+
+def test_an_explicit_kube_context_refuses_a_kubeconfig_file_named_with_a_trailing_slash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _with_service_account_token(tmp_path, monkeypatch)
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current=None
+    )
+    _with_kubeconfig_locations(monkeypatch, f"{kubeconfig}/")
+    loads = _record_credential_loads(monkeypatch)
+
+    with pytest.raises(k8s_config.ConfigException) as refused:
+        _connecting_environment(tmp_path, "remote-cluster").connect()
+
+    message = str(refused.value)
+    assert repr("remote-cluster") in message
+    assert f"{kubeconfig}/" in message
+    assert loads == []
+
+
+def test_without_kube_context_a_pod_uses_its_in_cluster_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _with_service_account_token(tmp_path, monkeypatch)
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current="remote-cluster"
+    )
+    _with_kubeconfig_locations(monkeypatch, kubeconfig)
+    loads = _record_credential_loads(monkeypatch)
+
+    _connecting_environment(tmp_path, None).connect()
+
+    assert loads == [("in-cluster", None)]
+
+
+def test_without_kube_context_off_cluster_loads_the_kubeconfigs_current_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current="remote-cluster"
+    )
+    _with_kubeconfig_locations(monkeypatch, kubeconfig)
+    loads = _record_credential_loads(monkeypatch)
+
+    _connecting_environment(tmp_path, None).connect()
+
+    assert loads == [("kubeconfig", None)]
+
+
+async def test_with_kube_context_the_dns_target_is_read_through_the_context_not_the_runners_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner's resolver names its own cluster's DNS, not the context's."""
+    _with_service_account_token(tmp_path, monkeypatch)
+    _with_runner_resolver(tmp_path, monkeypatch)
+    environment = _environment(tmp_path, FakeCluster())
+    environment.kube_context = "remote-cluster"
+
+    assert await environment.cluster_dns_probe_target() == "10.96.0.10"
+
+    override = _environment(
+        tmp_path / "override", FakeCluster(), cluster_dns_ip="10.0.0.53"
+    )
+    override.kube_context = "remote-cluster"
+    assert await override.cluster_dns_probe_target() == "10.0.0.53"
+
+
+async def test_with_kube_context_a_missing_kube_dns_service_is_refused_not_read_from_the_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _with_service_account_token(tmp_path, monkeypatch)
+    _with_runner_resolver(tmp_path, monkeypatch)
+    cluster = FakeCluster()
+    cluster.service_dns_ip = None
+    environment = _environment(tmp_path, cluster)
+    environment.kube_context = "remote-cluster"
+
+    with pytest.raises(RuntimeError, match="cluster_dns_ip"):
+        await environment.cluster_dns_probe_target()
 
 
 async def test_missing_cilium_refuses_a_restricted_trial_before_creating_its_pod(

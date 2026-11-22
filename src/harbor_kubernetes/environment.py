@@ -34,7 +34,7 @@ from harbor.models.trial.paths import TrialPaths
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.config.incluster_config import SERVICE_TOKEN_FILENAME
-from kubernetes.config.kube_config import KUBE_CONFIG_DEFAULT_LOCATION
+from kubernetes.config.kube_config import KUBE_CONFIG_DEFAULT_LOCATION, KubeConfigMerger
 from kubernetes.stream import stream
 
 from harbor_kubernetes.network_policy import (
@@ -272,6 +272,69 @@ def _validated_cluster_dns_ip(target: str) -> str:
     return str(address)
 
 
+_NO_KUBECONFIG_LOCATION: Final = (
+    "no kubeconfig location was given because KUBECONFIG names no file"
+)
+
+
+def _kubeconfig_locations(location: str) -> list[str]:
+    """Return the files an ``os.pathsep``-joined kubeconfig *location* names.
+
+    The location is split on ``os.pathsep`` and empty entries are dropped. Each entry
+    is expanded with ``os.path.expanduser`` and kept as that string, exactly as the
+    Kubernetes client reads it: an entry whose ``~`` cannot be expanded (the home of a
+    user that does not exist) is kept and does not raise, and the spelling is not
+    otherwise changed, so a trailing ``/`` or a leading ``./`` stays.
+    """
+    return [os.path.expanduser(entry) for entry in location.split(os.pathsep) if entry]
+
+
+def _require_kube_context(kube_context: str, location: str) -> None:
+    """Refuse a kube_context that the kubeconfig files at *location* do not define.
+
+    The files are read the way ``load_kube_config`` reads them (same files, order, and
+    merge). The refusal names the context and every file read, which the client's own
+    missing-context error does not. Files the client cannot read as a kubeconfig, and a
+    location that names no file, are refused the same way.
+    """
+    locations = _kubeconfig_locations(location)
+    if not locations:
+        raise k8s_config.ConfigException(
+            f"kube_context {kube_context!r} needs a kubeconfig, and "
+            + f"{_NO_KUBECONFIG_LOCATION}. Set KUBECONFIG to a kubeconfig file, "
+            + "or unset it to use ~/.kube/config."
+        )
+    looked_for = ", ".join(locations)
+    try:
+        merger = KubeConfigMerger(location)
+        names = (
+            None
+            if merger.config is None
+            else {context.value["name"] for context in merger.config.value["contexts"]}
+        )
+    except Exception as error:
+        # Any error while the client reads the files or while their context names are
+        # collected (YAML syntax, document shape, a directory for a file, a file it may
+        # not open, a contexts entry that is not a mapping or has no name) means the
+        # client cannot read the files as a kubeconfig.
+        raise k8s_config.ConfigException(
+            f"kube_context {kube_context!r} needs a kubeconfig, and the kubeconfig "
+            + f"cannot be read (looked for {looked_for}): {type(error).__name__}: "
+            + f"{error}. Correct the file that cannot be read, or set KUBECONFIG."
+        ) from error
+    if names is None:
+        raise k8s_config.ConfigException(
+            f"kube_context {kube_context!r} needs a kubeconfig, and no kubeconfig file "
+            + f"exists (looked for {looked_for}). Create one, or set KUBECONFIG."
+        )
+    if kube_context not in names:
+        raise k8s_config.ConfigException(
+            f"kube_context {kube_context!r} is not a context of the kubeconfig "
+            + f"(read {', '.join(merger.paths)}). Name a context that it defines, "
+            + "or set KUBECONFIG."
+        )
+
+
 def egress_probe(target: str) -> str:
     """Return a command that reports whether TCP DNS egress remains reachable."""
     return (
@@ -361,16 +424,17 @@ class KubernetesEnvironment(BaseEnvironment):
         """Refuse a run when neither in-cluster credentials nor a kubeconfig exists."""
         if Path(SERVICE_TOKEN_FILENAME).exists():
             return
-        kubeconfigs = [
-            Path(location).expanduser()
-            for location in KUBE_CONFIG_DEFAULT_LOCATION.split(os.pathsep)
-            if location
-        ]
-        if not any(path.is_file() for path in kubeconfigs):
+        kubeconfigs = _kubeconfig_locations(KUBE_CONFIG_DEFAULT_LOCATION)
+        if not any(os.path.isfile(path) for path in kubeconfigs):
+            searched = (
+                f"looked for {', '.join(kubeconfigs)}"
+                if kubeconfigs
+                else _NO_KUBECONFIG_LOCATION
+            )
             raise SystemExit(
                 "KubernetesEnvironment needs in-cluster service-account credentials "
                 + f"({SERVICE_TOKEN_FILENAME}) or a kubeconfig; found neither "
-                + f"(looked for {', '.join(str(path) for path in kubeconfigs)})."
+                + f"({searched})."
             )
 
     @classmethod
@@ -419,15 +483,25 @@ class KubernetesEnvironment(BaseEnvironment):
             raise ValueError(PUBLIC_NETWORK_REFUSAL)
         super().validate_network_policy_support(network_policy)
 
+    def _uses_kubeconfig(self) -> bool:
+        """Whether credentials come from a kubeconfig, not the pod's service account."""
+        return (
+            self.kube_context is not None or not Path(SERVICE_TOKEN_FILENAME).exists()
+        )
+
     def _connect(self) -> KubernetesApis:
         """Load credentials and construct isolated Kubernetes API clients."""
         configuration = k8s_client.Configuration()
-        if Path(SERVICE_TOKEN_FILENAME).exists():
-            k8s_config.load_incluster_config(client_configuration=configuration)
-        else:
+        if self._uses_kubeconfig():
+            if self.kube_context is not None:
+                _require_kube_context(self.kube_context, KUBE_CONFIG_DEFAULT_LOCATION)
             k8s_config.load_kube_config(
-                context=self.kube_context, client_configuration=configuration
+                config_file=KUBE_CONFIG_DEFAULT_LOCATION,
+                context=self.kube_context,
+                client_configuration=configuration,
             )
+        else:
+            k8s_config.load_incluster_config(client_configuration=configuration)
         rest_client = k8s_client.ApiClient(configuration)
 
         def open_exec(
@@ -882,10 +956,16 @@ class KubernetesEnvironment(BaseEnvironment):
         return self._cluster_dns_target
 
     async def cluster_dns_probe_target(self) -> str:
-        """Return the cluster DNS address used by no-network convergence probes."""
+        """Return the cluster DNS address used by no-network convergence probes.
+
+        An explicit ``cluster_dns_ip`` wins. The runner's resolver is read only on the
+        in-cluster credential path, because it names the DNS of the runner's own
+        cluster. Every other path reads the kube-system/kube-dns Service through the
+        API.
+        """
         if self.cluster_dns_ip is not None:
             return _validated_cluster_dns_ip(self.cluster_dns_ip)
-        if Path(SERVICE_TOKEN_FILENAME).exists():
+        if not self._uses_kubeconfig():
             try:
                 text = RUNNER_RESOLV_CONF.read_text(encoding="utf-8")
             except OSError as error:
