@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import pwd
@@ -91,7 +92,7 @@ def _with_service_account_token(
 
 
 def _with_kubeconfig_locations(
-    monkeypatch: pytest.MonkeyPatch, *locations: Path
+    monkeypatch: pytest.MonkeyPatch, *locations: str | Path
 ) -> None:
     from harbor_kubernetes import environment as module
 
@@ -104,6 +105,20 @@ def _with_kubeconfig_locations(
 
 # A ``~`` entry the client cannot expand: no user of this name exists.
 _UNEXPANDABLE_HOME_ENTRY = "~nosuchuser12345/config"
+
+
+def _uncheckable_entry(tmp_path: Path) -> Path:
+    """Return a path in *tmp_path* whose name is too long for the file system to stat.
+
+    ``os.stat`` raises OSError (ENAMETOOLONG) for it, where the client's own reader
+    sees no file. Should the file system accept such a name, the tests that use it
+    would prove nothing, so this fails first.
+    """
+    uncheckable = tmp_path / ("k" * 300)
+    with pytest.raises(OSError) as raised:
+        os.stat(uncheckable)
+    assert raised.value.errno == errno.ENAMETOOLONG
+    return uncheckable
 
 
 def _with_runner_resolver(
@@ -1027,9 +1042,7 @@ def test_preflight_accepts_a_kubeconfig_and_refuses_no_credentials(
 def test_preflight_with_no_kubeconfig_location_says_none_was_given(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str
 ) -> None:
-    from harbor_kubernetes import environment as module
-
-    monkeypatch.setattr(module, "KUBE_CONFIG_DEFAULT_LOCATION", location)
+    _with_kubeconfig_locations(monkeypatch, location)
     with pytest.raises(SystemExit) as refused:
         KubernetesEnvironment.preflight()
 
@@ -1046,33 +1059,23 @@ def test_preflight_with_no_kubeconfig_location_says_none_was_given(
 def test_preflight_accepts_a_kubeconfig_after_missing_and_empty_entries_or_under_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from harbor_kubernetes import environment as module
-
     kubeconfig = _write_kubeconfig(
         tmp_path / "kubeconfig", ["remote-cluster"], current="remote-cluster"
     )
-    monkeypatch.setattr(
-        module,
-        "KUBE_CONFIG_DEFAULT_LOCATION",
-        os.pathsep.join([str(tmp_path / "missing"), "", str(kubeconfig)]),
-    )
+    _with_kubeconfig_locations(monkeypatch, tmp_path / "missing", "", kubeconfig)
     KubernetesEnvironment.preflight()
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(module, "KUBE_CONFIG_DEFAULT_LOCATION", f"~/{kubeconfig.name}")
+    _with_kubeconfig_locations(monkeypatch, f"~/{kubeconfig.name}")
     KubernetesEnvironment.preflight()
 
 
 def test_preflight_skips_a_home_entry_it_cannot_expand(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from harbor_kubernetes import environment as module
-
     # Should such a user ever exist, the entry would expand and this test prove nothing.
     assert os.path.expanduser(_UNEXPANDABLE_HOME_ENTRY) == _UNEXPANDABLE_HOME_ENTRY
-    monkeypatch.setattr(
-        module, "KUBE_CONFIG_DEFAULT_LOCATION", _UNEXPANDABLE_HOME_ENTRY
-    )
+    _with_kubeconfig_locations(monkeypatch, _UNEXPANDABLE_HOME_ENTRY)
     with pytest.raises(SystemExit) as refused:
         KubernetesEnvironment.preflight()
 
@@ -1083,11 +1086,26 @@ def test_preflight_skips_a_home_entry_it_cannot_expand(
     kubeconfig = _write_kubeconfig(
         tmp_path / "kubeconfig", ["remote-cluster"], current="remote-cluster"
     )
-    monkeypatch.setattr(
-        module,
-        "KUBE_CONFIG_DEFAULT_LOCATION",
-        os.pathsep.join([_UNEXPANDABLE_HOME_ENTRY, "", str(kubeconfig)]),
+    _with_kubeconfig_locations(monkeypatch, _UNEXPANDABLE_HOME_ENTRY, "", kubeconfig)
+    KubernetesEnvironment.preflight()
+
+
+def test_preflight_skips_an_entry_it_cannot_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uncheckable = _uncheckable_entry(tmp_path)
+    _with_kubeconfig_locations(monkeypatch, uncheckable)
+    with pytest.raises(SystemExit) as refused:
+        KubernetesEnvironment.preflight()
+
+    message = str(refused.value)
+    assert "found neither" in message
+    assert str(uncheckable) in message
+
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current="remote-cluster"
     )
+    _with_kubeconfig_locations(monkeypatch, uncheckable, "", kubeconfig)
     KubernetesEnvironment.preflight()
 
 
@@ -1396,10 +1414,8 @@ def test_a_kube_context_with_no_kubeconfig_file_is_refused_naming_where_it_looke
 def test_a_kube_context_with_no_kubeconfig_location_is_refused_saying_none_was_given(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str
 ) -> None:
-    from harbor_kubernetes import environment as module
-
     _with_service_account_token(tmp_path, monkeypatch)
-    monkeypatch.setattr(module, "KUBE_CONFIG_DEFAULT_LOCATION", location)
+    _with_kubeconfig_locations(monkeypatch, location)
     loads = _record_credential_loads(monkeypatch)
 
     with pytest.raises(k8s_config.ConfigException) as refused:
@@ -1455,19 +1471,29 @@ def test_a_kube_context_whose_kubeconfig_is_not_a_kubeconfig_is_refused_naming_i
 def test_an_explicit_kube_context_skips_a_home_entry_it_cannot_expand(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from harbor_kubernetes import environment as module
-
     # Should such a user ever exist, the entry would expand and this test prove nothing.
     assert os.path.expanduser(_UNEXPANDABLE_HOME_ENTRY) == _UNEXPANDABLE_HOME_ENTRY
     _with_service_account_token(tmp_path, monkeypatch)
     kubeconfig = _write_kubeconfig(
         tmp_path / "kubeconfig", ["remote-cluster"], current=None
     )
-    monkeypatch.setattr(
-        module,
-        "KUBE_CONFIG_DEFAULT_LOCATION",
-        os.pathsep.join([_UNEXPANDABLE_HOME_ENTRY, "", str(kubeconfig)]),
+    _with_kubeconfig_locations(monkeypatch, _UNEXPANDABLE_HOME_ENTRY, "", kubeconfig)
+    loads = _record_credential_loads(monkeypatch)
+
+    _connecting_environment(tmp_path, "remote-cluster").connect()
+
+    assert loads == [("kubeconfig", "remote-cluster")]
+
+
+def test_an_explicit_kube_context_skips_an_entry_it_cannot_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uncheckable = _uncheckable_entry(tmp_path)
+    _with_service_account_token(tmp_path, monkeypatch)
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current=None
     )
+    _with_kubeconfig_locations(monkeypatch, uncheckable, "", kubeconfig)
     loads = _record_credential_loads(monkeypatch)
 
     _connecting_environment(tmp_path, "remote-cluster").connect()

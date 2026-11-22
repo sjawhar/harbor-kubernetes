@@ -280,8 +280,11 @@ _NO_KUBECONFIG_LOCATION: Final = (
 def _kubeconfig_locations(location: str) -> list[Path]:
     """Return the files an ``os.pathsep``-joined kubeconfig *location* names.
 
-    A ``~`` is expanded as the Kubernetes client expands it, so an entry it cannot
-    expand (the home of a user that does not exist) stays as written.
+    The location is split on ``os.pathsep`` and empty entries are dropped. A ``~`` is
+    expanded with ``os.path.expanduser``, as the Kubernetes client expands it, so an
+    entry it cannot expand (the home of a user that does not exist) is kept and does
+    not raise. ``Path`` then normalizes the spelling of each entry, for example by
+    dropping a doubled or trailing ``/``.
     """
     return [
         Path(os.path.expanduser(entry)) for entry in location.split(os.pathsep) if entry
@@ -312,13 +315,14 @@ def _require_kube_context(kube_context: str, location: str) -> None:
             else {context.value["name"] for context in merger.config.value["contexts"]}
         )
     except Exception as error:
-        # Any error while the files are read or their context names are collected
-        # (YAML syntax, document shape, a directory for a file, a contexts entry that
-        # is not a mapping or has no name) means the files are not a kubeconfig.
+        # Any error while the client reads the files or while their context names are
+        # collected (YAML syntax, document shape, a directory for a file, a file it may
+        # not open, a contexts entry that is not a mapping or has no name) means the
+        # client cannot read the files as a kubeconfig.
         raise k8s_config.ConfigException(
             f"kube_context {kube_context!r} needs a kubeconfig, and the kubeconfig "
             + f"cannot be read (looked for {looked_for}): {type(error).__name__}: "
-            + f"{error}. Correct the file that is not a kubeconfig, or set KUBECONFIG."
+            + f"{error}. Correct the file that cannot be read, or set KUBECONFIG."
         ) from error
     if names is None:
         raise k8s_config.ConfigException(
@@ -423,7 +427,7 @@ class KubernetesEnvironment(BaseEnvironment):
         if Path(SERVICE_TOKEN_FILENAME).exists():
             return
         kubeconfigs = _kubeconfig_locations(KUBE_CONFIG_DEFAULT_LOCATION)
-        if not any(path.is_file() for path in kubeconfigs):
+        if not any(os.path.isfile(path) for path in kubeconfigs):
             searched = (
                 f"looked for {', '.join(str(path) for path in kubeconfigs)}"
                 if kubeconfigs

@@ -62,8 +62,8 @@ service-account token. The context, not the token, then gives the cluster and th
 credential. If the kubeconfig does not hold that context, the environment
 refuses the trial before it makes a Kubernetes API call. The error names the context
 and the kubeconfig files that it read. The environment also refuses the trial when a
-kubeconfig file cannot be read as a kubeconfig, and when `KUBECONFIG` names no file.
-These errors also name the context.
+kubeconfig file cannot be opened or cannot be parsed as a kubeconfig, and when
+`KUBECONFIG` names no file. These errors also name the context.
 
 When `kube_context` is not set, a job that runs in a pod with a mounted
 service-account token uses that token and acts in the pod's own cluster. In such a
