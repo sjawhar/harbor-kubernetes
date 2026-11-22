@@ -1017,6 +1017,27 @@ def test_preflight_accepts_a_kubeconfig_and_refuses_no_credentials(
     KubernetesEnvironment.preflight()
 
 
+@pytest.mark.parametrize(
+    "location",
+    ["", os.pathsep],
+    ids=["empty", "separators-only"],
+)
+def test_preflight_with_no_kubeconfig_location_says_none_was_given(
+    monkeypatch: pytest.MonkeyPatch, location: str
+) -> None:
+    from harbor_kubernetes import environment as module
+
+    monkeypatch.setattr(module, "KUBE_CONFIG_DEFAULT_LOCATION", location)
+    with pytest.raises(SystemExit) as refused:
+        KubernetesEnvironment.preflight()
+
+    message = str(refused.value)
+    assert "found neither" in message
+    assert "no kubeconfig location" in message
+    assert "(looked for )" not in message
+    assert "looked for" not in message
+
+
 class _PodDeletionFails(FakeCluster):
     @override
     def delete_namespaced_pod(

@@ -272,6 +272,11 @@ def _validated_cluster_dns_ip(target: str) -> str:
     return str(address)
 
 
+def _kubeconfig_locations(location: str) -> list[Path]:
+    """Return the files an ``os.pathsep``-joined kubeconfig *location* names."""
+    return [Path(entry).expanduser() for entry in location.split(os.pathsep) if entry]
+
+
 def _require_kube_context(kube_context: str, location: str) -> None:
     """Refuse a kube_context that the kubeconfig files at *location* do not define.
 
@@ -280,16 +285,14 @@ def _require_kube_context(kube_context: str, location: str) -> None:
     missing-context error does not. Files the client cannot read as a kubeconfig, and a
     location that names no file, are refused the same way.
     """
-    paths = [
-        str(Path(path).expanduser()) for path in location.split(os.pathsep) if path
-    ]
-    if not paths:
+    locations = _kubeconfig_locations(location)
+    if not locations:
         raise k8s_config.ConfigException(
             f"kube_context {kube_context!r} needs a kubeconfig, and no kubeconfig "
             + "location was given because KUBECONFIG names no file. Set KUBECONFIG to a "
             + "kubeconfig file, or unset it to use ~/.kube/config."
         )
-    looked_for = ", ".join(paths)
+    looked_for = ", ".join(str(path) for path in locations)
     try:
         merger = KubeConfigMerger(location)
         names = (
@@ -407,16 +410,18 @@ class KubernetesEnvironment(BaseEnvironment):
         """Refuse a run when neither in-cluster credentials nor a kubeconfig exists."""
         if Path(SERVICE_TOKEN_FILENAME).exists():
             return
-        kubeconfigs = [
-            Path(location).expanduser()
-            for location in KUBE_CONFIG_DEFAULT_LOCATION.split(os.pathsep)
-            if location
-        ]
+        kubeconfigs = _kubeconfig_locations(KUBE_CONFIG_DEFAULT_LOCATION)
         if not any(path.is_file() for path in kubeconfigs):
+            searched = (
+                f"looked for {', '.join(str(path) for path in kubeconfigs)}"
+                if kubeconfigs
+                else "no kubeconfig location was given because KUBECONFIG names "
+                + "no file"
+            )
             raise SystemExit(
                 "KubernetesEnvironment needs in-cluster service-account credentials "
                 + f"({SERVICE_TOKEN_FILENAME}) or a kubeconfig; found neither "
-                + f"(looked for {', '.join(str(path) for path in kubeconfigs)})."
+                + f"({searched})."
             )
 
     @classmethod
