@@ -52,9 +52,21 @@ Configure the environment at the Harbor job level:
 }
 ```
 
-`namespace` is required. `kube_context` is used when no in-cluster service-account
-token exists. `runtime_class_name`, labels, annotations, image-pull policy, timeout,
-and ephemeral-storage quantities are optional pod settings.
+`namespace` is required. `runtime_class_name`, labels, annotations, image-pull policy,
+timeout, and ephemeral-storage quantities are optional pod settings.
+
+`kube_context` names a context of the kubeconfig: the files that `KUBECONFIG` names,
+or `~/.kube/config` when `KUBECONFIG` is not set. When `kube_context` is set, the
+environment uses that context, also when Harbor runs in a pod that has an in-cluster
+service-account token. The context, not the token, then gives the cluster and the
+credential. If the kubeconfig does not hold that context, the environment
+refuses the trial before it makes a Kubernetes API call. The error names the context
+and the kubeconfig files that it read.
+
+When `kube_context` is not set, a job that runs in a pod with a mounted
+service-account token uses that token and acts in the pod's own cluster. In such a
+pod, `KUBECONFIG` alone does not change the cluster. Elsewhere, the job uses the
+current context of the kubeconfig.
 
 A public Harbor task creates no network-policy object. Set
 `allow_public_network: false` to reject public task phases instead. Restricted
@@ -64,11 +76,14 @@ deleted only after the pod is gone. Those modes require a cluster serving
 `ciliumnetworkpolicies.cilium.io`; the package refuses a restricted trial before it
 creates a pod when Cilium is absent. Allowlists accept only IP addresses and CIDRs.
 
-For a no-network convergence check, set `cluster_dns_ip` when the cluster DNS Service
-is not `kube-system/kube-dns`. Otherwise the environment reads the runner's resolver
-inside a cluster and reads `kube-system/kube-dns`'s ClusterIP outside one. If it cannot
-find an address, it refuses the trial before creating its pod and names
-`cluster_dns_ip` in the error.
+The no-network convergence check needs the address of the cluster DNS. Set
+`cluster_dns_ip` to give that address, for example when the cluster DNS Service is not
+`kube-system/kube-dns`. Without `cluster_dns_ip`, a job that uses the in-cluster
+service-account token reads the first non-loopback nameserver of the runner's resolver.
+Every other job, a job with `kube_context` included, reads the ClusterIP of
+`kube-system/kube-dns` through its context, so that context needs `get` on that
+Service. If the environment cannot find an address, it refuses the trial before it
+creates the pod, and the error names `cluster_dns_ip`.
 
 ## Extension points
 
