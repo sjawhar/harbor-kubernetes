@@ -277,18 +277,16 @@ _NO_KUBECONFIG_LOCATION: Final = (
 )
 
 
-def _kubeconfig_locations(location: str) -> list[Path]:
+def _kubeconfig_locations(location: str) -> list[str]:
     """Return the files an ``os.pathsep``-joined kubeconfig *location* names.
 
-    The location is split on ``os.pathsep`` and empty entries are dropped. A ``~`` is
-    expanded with ``os.path.expanduser``, as the Kubernetes client expands it, so an
-    entry it cannot expand (the home of a user that does not exist) is kept and does
-    not raise. ``Path`` then normalizes the spelling of each entry, for example by
-    dropping a doubled or trailing ``/``.
+    The location is split on ``os.pathsep`` and empty entries are dropped. Each entry
+    is expanded with ``os.path.expanduser`` and kept as that string, exactly as the
+    Kubernetes client reads it: an entry whose ``~`` cannot be expanded (the home of a
+    user that does not exist) is kept and does not raise, and the spelling is not
+    otherwise changed, so a trailing ``/`` or a leading ``./`` stays.
     """
-    return [
-        Path(os.path.expanduser(entry)) for entry in location.split(os.pathsep) if entry
-    ]
+    return [os.path.expanduser(entry) for entry in location.split(os.pathsep) if entry]
 
 
 def _require_kube_context(kube_context: str, location: str) -> None:
@@ -306,7 +304,7 @@ def _require_kube_context(kube_context: str, location: str) -> None:
             + f"{_NO_KUBECONFIG_LOCATION}. Set KUBECONFIG to a kubeconfig file, "
             + "or unset it to use ~/.kube/config."
         )
-    looked_for = ", ".join(str(path) for path in locations)
+    looked_for = ", ".join(locations)
     try:
         merger = KubeConfigMerger(location)
         names = (
@@ -429,7 +427,7 @@ class KubernetesEnvironment(BaseEnvironment):
         kubeconfigs = _kubeconfig_locations(KUBE_CONFIG_DEFAULT_LOCATION)
         if not any(os.path.isfile(path) for path in kubeconfigs):
             searched = (
-                f"looked for {', '.join(str(path) for path in kubeconfigs)}"
+                f"looked for {', '.join(kubeconfigs)}"
                 if kubeconfigs
                 else _NO_KUBECONFIG_LOCATION
             )
