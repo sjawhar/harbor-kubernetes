@@ -1274,7 +1274,6 @@ def test_a_kube_context_the_kubeconfig_lacks_is_refused_before_any_credential_lo
         read = [remote, empty]
         locations = read
     else:
-        # The first file's current-context is the one a refusal must not fall back to.
         other = _write_kubeconfig(
             tmp_path / "other-kubeconfig", ["other-cluster"], current="other-cluster"
         )

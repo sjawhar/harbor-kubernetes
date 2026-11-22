@@ -83,7 +83,8 @@ service-account token reads the first non-loopback nameserver of the runner's re
 Every other job, a job with `kube_context` included, reads the ClusterIP of
 `kube-system/kube-dns` through its context, so that context needs `get` on that
 Service. If the environment cannot find an address, it refuses the trial before it
-creates the pod, and the error names `cluster_dns_ip`.
+creates the pod. When the `kube-system/kube-dns` lookup fails, the error says to set
+`cluster_dns_ip`.
 
 ## Extension points
 

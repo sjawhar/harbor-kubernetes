@@ -276,7 +276,8 @@ def _require_kube_context(kube_context: str, location: str) -> None:
     """Refuse a kube_context that the kubeconfig files at *location* do not define.
 
     The files are read the way ``load_kube_config`` reads them (same files, order, and
-    merge), so a missing context is refused instead of falling back to another one.
+    merge). The refusal names the context and every file read, which the client's own
+    missing-context error does not.
     """
     looked_for = ", ".join(
         str(Path(path).expanduser()) for path in location.split(os.pathsep) if path
