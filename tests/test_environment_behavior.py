@@ -1314,6 +1314,46 @@ def test_a_kube_context_with_no_kubeconfig_file_is_refused_naming_where_it_looke
     assert loads == []
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "apiVersion: v1\nclusters: [unclosed\n",
+        "- remote-cluster\n",
+        "a-bearer-token\n",
+        "apiVersion: v1\nkind: Config\ncontexts: [remote-cluster]\n",
+        None,
+    ],
+    ids=[
+        "malformed-yaml",
+        "yaml-list",
+        "yaml-scalar",
+        "context-not-a-mapping",
+        "directory",
+    ],
+)
+def test_a_kube_context_whose_kubeconfig_is_not_a_kubeconfig_is_refused_naming_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str | None
+) -> None:
+    """A file the client cannot read as a kubeconfig holds no context either."""
+    _with_service_account_token(tmp_path, monkeypatch)
+    broken = tmp_path / "broken-kubeconfig"
+    if content is None:
+        broken.mkdir()
+    else:
+        broken.write_text(content, encoding="utf-8")
+    _with_kubeconfig_locations(monkeypatch, broken)
+    loads = _record_credential_loads(monkeypatch)
+    environment = _connecting_environment(tmp_path, "remote-cluster")
+
+    with pytest.raises(k8s_config.ConfigException) as refused:
+        environment.connect()
+
+    message = str(refused.value)
+    assert repr("remote-cluster") in message
+    assert str(broken) in message
+    assert loads == []
+
+
 def test_without_kube_context_a_pod_uses_its_in_cluster_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
