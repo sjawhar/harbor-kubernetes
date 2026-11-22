@@ -272,9 +272,20 @@ def _validated_cluster_dns_ip(target: str) -> str:
     return str(address)
 
 
+_NO_KUBECONFIG_LOCATION: Final = (
+    "no kubeconfig location was given because KUBECONFIG names no file"
+)
+
+
 def _kubeconfig_locations(location: str) -> list[Path]:
-    """Return the files an ``os.pathsep``-joined kubeconfig *location* names."""
-    return [Path(entry).expanduser() for entry in location.split(os.pathsep) if entry]
+    """Return the files an ``os.pathsep``-joined kubeconfig *location* names.
+
+    A ``~`` is expanded as the Kubernetes client expands it, so an entry it cannot
+    expand (the home of a user that does not exist) stays as written.
+    """
+    return [
+        Path(os.path.expanduser(entry)) for entry in location.split(os.pathsep) if entry
+    ]
 
 
 def _require_kube_context(kube_context: str, location: str) -> None:
@@ -288,9 +299,9 @@ def _require_kube_context(kube_context: str, location: str) -> None:
     locations = _kubeconfig_locations(location)
     if not locations:
         raise k8s_config.ConfigException(
-            f"kube_context {kube_context!r} needs a kubeconfig, and no kubeconfig "
-            + "location was given because KUBECONFIG names no file. Set KUBECONFIG to a "
-            + "kubeconfig file, or unset it to use ~/.kube/config."
+            f"kube_context {kube_context!r} needs a kubeconfig, and "
+            + f"{_NO_KUBECONFIG_LOCATION}. Set KUBECONFIG to a kubeconfig file, "
+            + "or unset it to use ~/.kube/config."
         )
     looked_for = ", ".join(str(path) for path in locations)
     try:
@@ -301,12 +312,13 @@ def _require_kube_context(kube_context: str, location: str) -> None:
             else {context.value["name"] for context in merger.config.value["contexts"]}
         )
     except Exception as error:
-        # Any error of the client's reader (YAML syntax, document shape, a directory
-        # for a file) means the files are not a kubeconfig.
+        # Any error while the files are read or their context names are collected
+        # (YAML syntax, document shape, a directory for a file, a contexts entry that
+        # is not a mapping or has no name) means the files are not a kubeconfig.
         raise k8s_config.ConfigException(
             f"kube_context {kube_context!r} needs a kubeconfig, and the kubeconfig "
-            + f"cannot be read (looked for {looked_for}): {error}. Correct that file, "
-            + "or set KUBECONFIG."
+            + f"cannot be read (looked for {looked_for}): {type(error).__name__}: "
+            + f"{error}. Correct the file that is not a kubeconfig, or set KUBECONFIG."
         ) from error
     if names is None:
         raise k8s_config.ConfigException(
@@ -415,8 +427,7 @@ class KubernetesEnvironment(BaseEnvironment):
             searched = (
                 f"looked for {', '.join(str(path) for path in kubeconfigs)}"
                 if kubeconfigs
-                else "no kubeconfig location was given because KUBECONFIG names "
-                + "no file"
+                else _NO_KUBECONFIG_LOCATION
             )
             raise SystemExit(
                 "KubernetesEnvironment needs in-cluster service-account credentials "

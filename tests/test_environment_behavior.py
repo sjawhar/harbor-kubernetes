@@ -102,12 +102,21 @@ def _with_kubeconfig_locations(
     )
 
 
-def _with_runner_resolver(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+# A ``~`` entry the client cannot expand: no user of this name exists.
+_UNEXPANDABLE_HOME_ENTRY = "~nosuchuser12345/config"
+
+
+def _with_runner_resolver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    content: str = "nameserver 172.20.0.10\n",
+) -> Path:
     from harbor_kubernetes import environment as module
 
     resolver = tmp_path / "resolv.conf"
-    resolver.write_text("nameserver 172.20.0.10\n", encoding="utf-8")
+    resolver.write_text(content, encoding="utf-8")
     monkeypatch.setattr(module, "RUNNER_RESOLV_CONF", resolver)
+    return resolver
 
 
 def _write_kubeconfig(path: Path, contexts: list[str], current: str | None) -> Path:
@@ -709,17 +718,11 @@ def test_the_egress_probe_targets_an_explicit_cluster_dns_ip_not_the_pods_resolv
 async def test_the_convergence_target_is_the_runners_non_loopback_nameserver(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from harbor_kubernetes import environment as module
-
     environment = _environment(tmp_path, FakeCluster())
-    token = tmp_path / "token"
-    token.write_text("in-cluster", encoding="utf-8")
-    monkeypatch.setattr(module, "SERVICE_TOKEN_FILENAME", str(token))
-    resolver = tmp_path / "resolv.conf"
-    resolver.write_text(
-        "nameserver 127.0.0.1\nnameserver 172.20.0.10\n", encoding="utf-8"
+    _with_service_account_token(tmp_path, monkeypatch)
+    resolver = _with_runner_resolver(
+        tmp_path, monkeypatch, "nameserver 127.0.0.1\nnameserver 172.20.0.10\n"
     )
-    monkeypatch.setattr(module, "RUNNER_RESOLV_CONF", resolver)
     assert await environment.cluster_dns_probe_target() == "172.20.0.10"
 
     resolver.write_text("nameserver 127.0.0.53\n", encoding="utf-8")
@@ -1008,7 +1011,6 @@ def test_preflight_accepts_a_kubeconfig_and_refuses_no_credentials(
     from harbor_kubernetes import environment as module
 
     kubeconfig = tmp_path / "kubeconfig"
-    monkeypatch.setattr(module, "SERVICE_TOKEN_FILENAME", str(tmp_path / "no"))
     monkeypatch.setattr(module, "KUBE_CONFIG_DEFAULT_LOCATION", str(kubeconfig))
     with pytest.raises(SystemExit, match="found neither"):
         KubernetesEnvironment.preflight()
@@ -1034,7 +1036,6 @@ def test_preflight_with_no_kubeconfig_location_says_none_was_given(
     message = str(refused.value)
     assert "found neither" in message
     assert "no kubeconfig location" in message
-    assert "(looked for )" not in message
     assert "looked for" not in message
 
     # With an in-cluster token, preflight accepts the run whatever KUBECONFIG names.
@@ -1059,6 +1060,34 @@ def test_preflight_accepts_a_kubeconfig_after_missing_and_empty_entries_or_under
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(module, "KUBE_CONFIG_DEFAULT_LOCATION", f"~/{kubeconfig.name}")
+    KubernetesEnvironment.preflight()
+
+
+def test_preflight_skips_a_home_entry_it_cannot_expand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from harbor_kubernetes import environment as module
+
+    # Should such a user ever exist, the entry would expand and this test prove nothing.
+    assert os.path.expanduser(_UNEXPANDABLE_HOME_ENTRY) == _UNEXPANDABLE_HOME_ENTRY
+    monkeypatch.setattr(
+        module, "KUBE_CONFIG_DEFAULT_LOCATION", _UNEXPANDABLE_HOME_ENTRY
+    )
+    with pytest.raises(SystemExit) as refused:
+        KubernetesEnvironment.preflight()
+
+    message = str(refused.value)
+    assert "found neither" in message
+    assert _UNEXPANDABLE_HOME_ENTRY in message
+
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current="remote-cluster"
+    )
+    monkeypatch.setattr(
+        module,
+        "KUBE_CONFIG_DEFAULT_LOCATION",
+        os.pathsep.join([_UNEXPANDABLE_HOME_ENTRY, "", str(kubeconfig)]),
+    )
     KubernetesEnvironment.preflight()
 
 
@@ -1421,6 +1450,29 @@ def test_a_kube_context_whose_kubeconfig_is_not_a_kubeconfig_is_refused_naming_i
     assert repr("remote-cluster") in message
     assert str(broken) in message
     assert loads == []
+
+
+def test_an_explicit_kube_context_skips_a_home_entry_it_cannot_expand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from harbor_kubernetes import environment as module
+
+    # Should such a user ever exist, the entry would expand and this test prove nothing.
+    assert os.path.expanduser(_UNEXPANDABLE_HOME_ENTRY) == _UNEXPANDABLE_HOME_ENTRY
+    _with_service_account_token(tmp_path, monkeypatch)
+    kubeconfig = _write_kubeconfig(
+        tmp_path / "kubeconfig", ["remote-cluster"], current=None
+    )
+    monkeypatch.setattr(
+        module,
+        "KUBE_CONFIG_DEFAULT_LOCATION",
+        os.pathsep.join([_UNEXPANDABLE_HOME_ENTRY, "", str(kubeconfig)]),
+    )
+    loads = _record_credential_loads(monkeypatch)
+
+    _connecting_environment(tmp_path, "remote-cluster").connect()
+
+    assert loads == [("kubeconfig", "remote-cluster")]
 
 
 def test_without_kube_context_a_pod_uses_its_in_cluster_credential(
