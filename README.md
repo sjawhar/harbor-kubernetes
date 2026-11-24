@@ -5,7 +5,9 @@ environment extension. It runs each Harbor trial as one Kubernetes pod from the 
 `[environment].docker_image`, and carries Harbor's commands and file transfers over
 Kubernetes exec. Uploads use 64 KiB stdin frames so a large artifact does not require
 the API server to accept one artifact-sized WebSocket frame. Receivers consume the
-advertised byte count rather than waiting for stdin EOF, and reject short input.
+advertised byte count rather than waiting for stdin EOF, and reject short input. A
+receiver also reads the whole advertised byte count when one of its steps fails, so a
+failed upload fails at once rather than waiting on input that nobody reads.
 Directory archives are staged in a temporary file for length verification before
 extraction.
 
