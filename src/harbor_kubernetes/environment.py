@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -10,6 +11,7 @@ import os
 import re
 import shlex
 import tarfile
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -342,6 +344,43 @@ def egress_probe(target: str) -> str:
         + f'if timeout 4 bash -c "</dev/tcp/{target}/{DNS_PORT}" >/dev/null 2>&1; '
         + "then echo OPEN; else echo CLOSED; fi"
     )
+
+
+def _close_on_own_thread(exec_stream: ExecStream) -> asyncio.Future[None]:
+    """Start ``exec_stream.close()`` on a thread of its own; return a future of its end.
+
+    ``WSClient.close`` waits up to 3 s for the server's close frame, which the server does
+    not send while the command still runs, so the close must not hold the event loop. It
+    does not run on the loop's default executor either: after a timeout or a cancellation,
+    workers there still run ``collect_output`` until their streams close, and when they
+    hold every worker a queued close does not start, and a cancellation of its await
+    withdraws it. The thread starts before the caller awaits, so no cancellation stops it.
+    """
+    loop = asyncio.get_running_loop()
+    ended: asyncio.Future[None] = loop.create_future()
+
+    def close() -> None:
+        error: BaseException | None = None
+        try:
+            exec_stream.close()
+        except BaseException as caught:  # noqa: BLE001 - the awaiting coroutine raises it
+            error = caught
+        # A loop that has closed has nobody left waiting for the close.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(_settle_close, ended, error)
+
+    threading.Thread(target=close, name="exec-stream-close", daemon=True).start()
+    return ended
+
+
+def _settle_close(ended: asyncio.Future[None], error: BaseException | None) -> None:
+    if ended.done():
+        # A second cancellation stopped the wait; the close ended all the same.
+        return
+    if error is None:
+        ended.set_result(None)
+    else:
+        ended.set_exception(error)
 
 
 class KubernetesEnvironment(BaseEnvironment):
@@ -1051,7 +1090,7 @@ class KubernetesEnvironment(BaseEnvironment):
             else:
                 stdout, stderr = await asyncio.wait_for(collected, client_timeout_sec)
         finally:
-            exec_stream.close()
+            await _close_on_own_thread(exec_stream)
         return return_code(exec_stream), stdout, stderr
 
     def remote_command(
