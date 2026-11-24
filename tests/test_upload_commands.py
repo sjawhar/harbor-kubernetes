@@ -9,9 +9,11 @@ from __future__ import annotations
 import errno
 import os
 import random
+import signal
 import subprocess
 import threading
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -22,8 +24,8 @@ from harbor_kubernetes.transport import (
     pack_directory,
 )
 
-# 16 times the 64 KiB that a Linux pipe holds, so bytes a command leaves unread stay
-# visible to the test rather than fitting in the pipe.
+# 1.5 MiB, far more than the 64 KiB a Linux pipe holds, so bytes a command leaves unread
+# stay visible to the test rather than fitting in the pipe.
 _PAYLOAD_BYTES = 3 * 512 * 1024
 # Each case ends in well under a second. Only a command that waits for more input,
 # which never comes, reaches this.
@@ -43,8 +45,8 @@ def _payload() -> bytes:
     return random.Random(0).randbytes(_PAYLOAD_BYTES)
 
 
-def _file_upload(count: int, target: Path, mode: str = "644") -> list[str]:
-    return ["/bin/sh", "-c", UPLOAD_FILE_SCRIPT, "sh", str(count), str(target), mode]
+def _file_upload(count: int, target: Path) -> list[str]:
+    return ["/bin/sh", "-c", UPLOAD_FILE_SCRIPT, "sh", str(count), str(target), "644"]
 
 
 def _dir_upload(count: int, target: Path) -> list[str]:
@@ -83,41 +85,67 @@ def _send(write_end: int, payload: bytes) -> None:
         view = view[os.write(write_end, view) :]
 
 
-def _run_with_open_input(argv: list[str], payload: bytes, tmp_path: Path) -> _Finished:
+def _run_with_open_input(
+    argv: list[str],
+    payload: bytes,
+    tmp_path: Path,
+    exit_within_sec: float = _EXIT_WITHIN_SEC,
+) -> _Finished:
     """Run *argv* with *payload* on a pipe that stays open after the last byte.
 
     The test keeps the pipe's read end as well, so the bytes the command did not read
     are still there after it exits, and are counted.
     """
     read_end, write_end = os.pipe()
+    writer = threading.Thread(target=partial(_send, write_end, payload), daemon=True)
     try:
+        # A session of its own lets a timeout kill the whole pipeline: its children
+        # hold stderr open after the shell itself is gone.
         with subprocess.Popen(
             argv,
             stdin=read_end,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             env={**os.environ, "TMPDIR": str(tmp_path)},
+            errors="replace",
+            start_new_session=True,
         ) as process:
-            writer = threading.Thread(
-                target=_send, args=(write_end, payload), daemon=True
-            )
             writer.start()
             try:
-                _, stderr = process.communicate(timeout=_EXIT_WITHIN_SEC)
-                exited = True
+                stderr: str = process.communicate(timeout=exit_within_sec)[1]
             except subprocess.TimeoutExpired:
-                process.kill()
-                _, stderr = process.communicate()
-                exited = False
-            unread = _count_unread(read_end, writer)
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+                pytest.fail(f"the command did not exit within {exit_within_sec} s")
+            finally:
+                # The writer finishes before either end of its pipe closes.
+                unread = _count_unread(read_end, writer)
     finally:
         os.close(write_end)
         os.close(read_end)
-    if not exited:
-        pytest.fail(f"the command did not exit within {_EXIT_WITHIN_SEC} s")
-    return _Finished(
-        process.returncode, stderr.decode("utf-8", errors="replace"), unread
-    )
+    return _Finished(process.returncode, stderr, unread)
+
+
+@pytest.mark.parametrize("consumed", [0, 17])
+def test_the_input_harness_counts_bytes_the_command_does_not_read(
+    tmp_path: Path, consumed: int
+) -> None:
+    payload = _payload()
+    argv = ["/bin/sh", "-c", 'head -c "$1" > /dev/null', "sh", str(consumed)]
+
+    finished = _run_with_open_input(argv, payload, tmp_path)
+
+    assert finished.returncode == 0, finished.stderr
+    assert finished.unread == len(payload) - consumed
+
+
+def test_a_timed_out_upload_terminates_its_pipeline(tmp_path: Path) -> None:
+    payload = _payload()
+    # Both heads wait for the missing byte while the input pipe stays open.
+    argv = _file_upload(len(payload) + 1, tmp_path / "received")
+
+    with pytest.raises(pytest.fail.Exception, match="the command did not exit within"):
+        _run_with_open_input(argv, payload, tmp_path, exit_within_sec=0.1)
 
 
 def _archive_of(payload: bytes, tmp_path: Path) -> bytes:
@@ -134,7 +162,7 @@ def test_an_upload_whose_first_step_fails_reads_its_bytes_and_fails_at_once(
     sent = _archive_of(_payload(), tmp_path) if directory else _payload()
     # mkdir -p cannot make a directory under a regular file.
     blocker = tmp_path / "a-file"
-    blocker.write_bytes(b"")
+    blocker.touch()
     target = blocker / "received"
     argv = (
         _dir_upload(len(sent), target)
