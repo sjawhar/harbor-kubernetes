@@ -8,7 +8,6 @@ then blocks for a set time in the same way.
 from __future__ import annotations
 
 import asyncio
-import gc
 import threading
 import time
 from collections.abc import AsyncGenerator, Callable, Generator
@@ -194,6 +193,17 @@ def _use_one_default_worker() -> None:
     )
 
 
+def _queue_behind_open_exec() -> threading.Event:
+    """Queue an event's ``set`` on the default executor's one worker, behind ``open_exec``.
+
+    Call it while ``open_exec`` blocks that worker. Once the event is set, the worker has
+    returned from the whole of ``_ExecStreamHandoff.open``, not only from ``open_exec``.
+    """
+    ended = threading.Event()
+    asyncio.get_running_loop().run_in_executor(None, ended.set)
+    return ended
+
+
 async def _tick(wakes: list[float]) -> None:
     while True:
         await asyncio.sleep(_TICK_SEC)
@@ -240,17 +250,20 @@ def _capture_unhandled_exceptions() -> Generator[list[dict[str, Any]]]:
         loop.set_exception_handler(previous)
 
 
-async def _until_tasks_in(
-    loop: asyncio.AbstractEventLoop,
-    baseline: set[asyncio.Task[Any]],
-    *,
-    within_sec: float,
-) -> None:
-    deadline = time.monotonic() + within_sec
-    while not asyncio.all_tasks(loop) <= baseline:
-        if time.monotonic() > deadline:
-            pytest.fail(f"waited {within_sec} s for background tasks to settle")
-        await asyncio.sleep(0.01)
+@contextmanager
+def _capture_thread_exceptions() -> Generator[list[BaseException | None]]:
+    """Record what each thread lets escape, which ``threading.excepthook`` would report."""
+    previous = threading.excepthook
+    escaped: list[BaseException | None] = []
+
+    def record(args: threading.ExceptHookArgs) -> None:
+        escaped.append(args.exc_value)
+
+    threading.excepthook = record
+    try:
+        yield escaped
+    finally:
+        threading.excepthook = previous
 
 
 async def _until_thread_exits(thread: threading.Thread, *, within_sec: float) -> None:
@@ -391,6 +404,59 @@ async def test_a_cancellation_during_open_exec_closes_the_stream_off_the_loop(
     assert not stream.close_thread_name.startswith(_DEFAULT_WORKER_PREFIX)
 
 
+async def test_a_cancellation_after_open_exec_published_its_stream_closes_it_off_the_loop(
+    tmp_path: Path,
+) -> None:
+    """``open_exec`` returns and its stream is published before ``_run`` resumes.
+
+    A cancellation then reaches ``_run`` before the loop hands it that stream, so the
+    ``finally`` that closes a stream ``_run`` holds never runs. Only ``abandon`` can start
+    the close of the stream already published.
+    """
+    _use_one_default_worker()
+    loop_thread_id = threading.get_ident()
+    stream = _SlowCloseStream()
+    cluster = _BlockedOpenCluster(stream)
+    environment = fake_environment(_Environment, tmp_path, cluster)
+    assert isinstance(environment, _Environment)
+    run = asyncio.create_task(environment.run_command())
+
+    try:
+        await _until(cluster.opening, within_sec=_SLACK_SEC)
+        open_ended = _queue_behind_open_exec()
+        cluster.release_open.set()
+        # This blocks the loop's thread, so the loop cannot resume _run in the meantime.
+        assert open_ended.wait(_SLACK_SEC), (
+            f"the worker did not return from the open within {_SLACK_SEC} s"
+        )
+        assert not run.done()
+        run.cancel()
+        done, _ = await asyncio.wait({run}, timeout=_SLACK_SEC)
+        assert run in done, "_run did not raise its cancellation"
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        # The close's time fits in this wait; a stream nobody closes never sets closed.
+        deadline = time.monotonic() + _CLOSE_SEC + _SLACK_SEC
+        while not stream.closed.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+    finally:
+        cluster.release_open.set()
+        stream.end_command()
+
+    assert stream.closes == 1, (
+        "the stream published before the cancellation was left unclosed "
+        + f"(closes={stream.closes})"
+    )
+    assert stream.closed.is_set(), (
+        f"the stream close did not finish within {_CLOSE_SEC + _SLACK_SEC} s"
+    )
+    assert stream.close_thread_id is not None
+    assert stream.close_thread_id != loop_thread_id
+    assert stream.close_thread_id != cluster.open_thread_id
+    assert stream.close_thread_name is not None
+    assert not stream.close_thread_name.startswith(_DEFAULT_WORKER_PREFIX)
+
+
 async def test_a_cancellation_during_open_exec_that_raises_leaves_no_unhandled_exception(
     tmp_path: Path,
 ) -> None:
@@ -399,10 +465,11 @@ async def test_a_cancellation_during_open_exec_that_raises_leaves_no_unhandled_e
     cluster = _FailingOpenCluster(stream, RuntimeError("exec upgrade failed"))
     environment = fake_environment(_Environment, tmp_path, cluster)
     assert isinstance(environment, _Environment)
-    loop = asyncio.get_running_loop()
-    baseline = asyncio.all_tasks(loop)
 
-    with _capture_unhandled_exceptions() as unhandled:
+    with (
+        _capture_unhandled_exceptions() as unhandled,
+        _capture_thread_exceptions() as escaped,
+    ):
         run = asyncio.create_task(environment.run_command())
         try:
             await _until(cluster.opening, within_sec=_SLACK_SEC)
@@ -412,18 +479,17 @@ async def test_a_cancellation_during_open_exec_that_raises_leaves_no_unhandled_e
             with pytest.raises(asyncio.CancelledError):
                 await run
 
+            open_ended = _queue_behind_open_exec()
             cluster.release_open.set()
             await _until(cluster.open_returned, within_sec=_SLACK_SEC)
-            await _until_tasks_in(loop, baseline, within_sec=_SLACK_SEC)
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
-            gc.collect()
+            await _until(open_ended, within_sec=_SLACK_SEC)
         finally:
             cluster.release_open.set()
             stream.end_command()
 
     assert stream.closes == 0
     assert unhandled == []
+    assert escaped == []
 
 
 async def test_a_cancellation_during_open_exec_whose_close_raises_leaves_no_unhandled_exception(
@@ -435,10 +501,11 @@ async def test_a_cancellation_during_open_exec_whose_close_raises_leaves_no_unha
     cluster = _BlockedOpenCluster(stream)
     environment = fake_environment(_Environment, tmp_path, cluster)
     assert isinstance(environment, _Environment)
-    loop = asyncio.get_running_loop()
-    baseline = asyncio.all_tasks(loop)
 
-    with _capture_unhandled_exceptions() as unhandled:
+    with (
+        _capture_unhandled_exceptions() as unhandled,
+        _capture_thread_exceptions() as escaped,
+    ):
         run = asyncio.create_task(environment.run_command())
         try:
             await _until(cluster.opening, within_sec=_SLACK_SEC)
@@ -451,12 +518,9 @@ async def test_a_cancellation_during_open_exec_whose_close_raises_leaves_no_unha
             cluster.release_open.set()
             await _until(cluster.open_returned, within_sec=_SLACK_SEC)
             await _until(stream.closed, within_sec=_SLACK_SEC)
-            await _until_tasks_in(loop, baseline, within_sec=_SLACK_SEC)
             assert stream.close_thread is not None
+            # The thread reports what it lets escape before it exits.
             await _until_thread_exits(stream.close_thread, within_sec=_SLACK_SEC)
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
-            gc.collect()
         finally:
             cluster.release_open.set()
             stream.end_command()
@@ -468,6 +532,7 @@ async def test_a_cancellation_during_open_exec_whose_close_raises_leaves_no_unha
     assert stream.close_thread_name is not None
     assert not stream.close_thread_name.startswith(_DEFAULT_WORKER_PREFIX)
     assert unhandled == []
+    assert escaped == []
 
 
 def test_a_stream_that_open_exec_returns_after_the_loop_ends_is_closed(
@@ -475,10 +540,11 @@ def test_a_stream_that_open_exec_returns_after_the_loop_ends_is_closed(
 ) -> None:
     """A caller cancels ``_run`` while ``open_exec`` blocks, and then its loop ends.
 
-    ``asyncio.run`` cancels every task that is left when its coroutine returns, as a
-    shutdown that cancels all tasks does, and only then waits for the default executor's
-    workers. So ``open_exec`` returns its stream after the loop has stopped running
-    callbacks, and nothing on the loop can close that stream any more.
+    Once the main coroutine returns, ``asyncio.run`` cancels the tasks left on the loop,
+    as a shutdown that cancels all tasks does, and then still runs the loop while it waits
+    for the default executor's workers. ``open_exec`` returns its stream during that wait.
+    An earlier ``_run`` left the close of a late stream to the task that opened it, and
+    that task is cancelled by the time ``open_exec`` returns, so it closed nothing.
     """
     caller_thread_id = threading.get_ident()
     stream = _SlowCloseStream()
@@ -491,11 +557,21 @@ def test_a_stream_that_open_exec_returns_after_the_loop_ends_is_closed(
     async def cancel_while_open_exec_blocks() -> None:
         _use_one_default_worker()
         run = asyncio.create_task(environment.run_command())
-        await _until(cluster.opening, within_sec=_SLACK_SEC)
-        run.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await run
-        assert not cluster.open_returned.is_set()
+        try:
+            await _until(cluster.opening, within_sec=_SLACK_SEC)
+            run.cancel()
+            done, _ = await asyncio.wait({run}, timeout=_SLACK_SEC)
+            assert run in done, (
+                "_run did not raise its cancellation while open_exec blocked"
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await run
+            assert not cluster.open_returned.is_set()
+        except BaseException:
+            # Release the executor even if a broken _run keeps collecting output.
+            stream.end_command()
+            cluster.release_open.set()
+            raise
         release.start()
 
     try:

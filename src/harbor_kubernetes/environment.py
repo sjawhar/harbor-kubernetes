@@ -403,12 +403,14 @@ def _settle_close(ended: asyncio.Future[None], error: BaseException | None) -> N
 
 
 class _ExecStreamHandoff:
-    """Decides whether ``_run`` or the thread that runs ``open_exec`` closes its stream.
+    """Decides whether ``_run`` or the ``open_exec`` thread starts the stream's close.
 
     A cancellation of ``_run`` does not stop ``open_exec`` on its worker thread, and the
     event loop can end before ``open_exec`` returns. So the two sides share a lock: a
-    cancelled ``_run`` takes a stream that is already published or gives it up, and the
-    worker closes a stream that was given up. Neither side leaves the close to the loop.
+    cancelled ``_run`` gives the stream up and starts the close of one already published,
+    and the worker starts the close of a stream that was given up. Either side only
+    starts the close on a dedicated thread; neither calls ``close`` itself or leaves the
+    close to the loop.
     """
 
     def __init__(self) -> None:
@@ -424,7 +426,11 @@ class _ExecStreamHandoff:
         command: list[str],
         stdin: bool,
     ) -> ExecStream:
-        """Run ``open_exec``; publish its stream for ``_run``, or close it if given up."""
+        """Run ``open_exec``, then publish its stream or start its close.
+
+        The stream goes to ``_run``. If ``abandon`` gave it up first, this instead starts
+        its close on a dedicated thread and returns without waiting for the close.
+        """
         exec_stream = open_exec(pod, namespace, command, stdin)
         with self._lock:
             abandoned = self._abandoned
@@ -435,7 +441,11 @@ class _ExecStreamHandoff:
         return exec_stream
 
     def abandon(self) -> None:
-        """Give the stream up for a cancelled ``_run``; close one already published."""
+        """Give the stream up for a cancelled ``_run``.
+
+        If ``open`` already published the stream, this starts its close on a dedicated
+        thread, so ``_run`` raises its cancellation without waiting for the close.
+        """
         with self._lock:
             self._abandoned = True
             exec_stream = self._stream
