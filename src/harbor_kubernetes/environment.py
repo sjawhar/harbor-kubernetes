@@ -383,6 +383,18 @@ def _settle_close(ended: asyncio.Future[None], error: BaseException | None) -> N
         ended.set_exception(error)
 
 
+def _discard_close_outcome(ended: asyncio.Future[None]) -> None:
+    if not ended.cancelled():
+        _ = ended.exception()
+
+
+def _close_late_stream(opening: asyncio.Task[ExecStream]) -> None:
+    """Close an exec stream that arrived after ``_run`` was cancelled."""
+    if opening.cancelled() or opening.exception() is not None:
+        return
+    _close_on_own_thread(opening.result()).add_done_callback(_discard_close_outcome)
+
+
 class KubernetesEnvironment(BaseEnvironment):
     """Single-pod Harbor environment on any Kubernetes cluster.
 
@@ -1071,10 +1083,16 @@ class KubernetesEnvironment(BaseEnvironment):
         client_timeout_sec: float | None = None,
     ) -> tuple[int, bytes, bytes]:
         apis = await self._apis()
-        try:
-            exec_stream = await asyncio.to_thread(
+        opening: asyncio.Task[ExecStream] = asyncio.create_task(
+            asyncio.to_thread(
                 apis.open_exec, self.pod_name, self.namespace, argv, stdin is not None
             )
+        )
+        try:
+            exec_stream = await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            opening.add_done_callback(_close_late_stream)
+            raise
         except k8s_client.ApiException as error:
             if error.status == 404:
                 raise KubernetesPodGoneError(

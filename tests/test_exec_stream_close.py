@@ -8,13 +8,14 @@ then blocks for a set time in the same way.
 from __future__ import annotations
 
 import asyncio
+import gc
 import threading
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import override
+from typing import Any, final, override
 
 import pytest
 
@@ -126,6 +127,47 @@ class _BlockedOpenCluster(_OneStreamCluster):
         return stream
 
 
+@final
+class _FailingOpenCluster(_BlockedOpenCluster):
+    """A cluster whose blocked ``open_exec`` raises once released."""
+
+    def __init__(self, stream: _SlowCloseStream, error: BaseException) -> None:
+        super().__init__(stream)
+        self._error: BaseException = error
+
+    @override
+    def open_exec(
+        self, pod: str, namespace: str, command: list[str], stdin: bool
+    ) -> FakeExecStream:
+        self.open_thread_id = threading.get_ident()
+        self.opening.set()
+        self.release_open.wait()
+        self.open_returned.set()
+        raise self._error
+
+
+@final
+class _FailingCloseStream(_SlowCloseStream):
+    """A stream whose ``close`` records the thread and raises."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self._error: BaseException = error
+        self.close_thread: threading.Thread | None = None
+
+    @override
+    def close(self) -> None:
+        with self._lock:
+            self.closes += 1
+            self.close_thread = threading.current_thread()
+            self.close_thread_id = threading.get_ident()
+            self.close_thread_name = self.close_thread.name
+        FakeExecStream.close(self)
+        self.closing.set()
+        self.closed.set()
+        raise self._error
+
+
 class _Environment(KubernetesEnvironment):
     async def run_command(
         self, *, client_timeout_sec: float | None = None
@@ -179,6 +221,43 @@ async def _until(event: threading.Event, within_sec: float) -> None:
     while not event.is_set():
         if time.monotonic() > deadline:
             pytest.fail(f"waited {within_sec} s for the stand-in stream")
+        await asyncio.sleep(0.01)
+
+
+@contextmanager
+def _capture_unhandled_exceptions() -> Generator[list[dict[str, Any]]]:
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    unhandled: list[dict[str, Any]] = []
+
+    def record(_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        unhandled.append(context)
+
+    loop.set_exception_handler(record)
+    try:
+        yield unhandled
+    finally:
+        loop.set_exception_handler(previous)
+
+
+async def _until_tasks_in(
+    loop: asyncio.AbstractEventLoop,
+    baseline: set[asyncio.Task[Any]],
+    *,
+    within_sec: float,
+) -> None:
+    deadline = time.monotonic() + within_sec
+    while not asyncio.all_tasks(loop) <= baseline:
+        if time.monotonic() > deadline:
+            pytest.fail(f"waited {within_sec} s for background tasks to settle")
+        await asyncio.sleep(0.01)
+
+
+async def _until_thread_exits(thread: threading.Thread, *, within_sec: float) -> None:
+    deadline = time.monotonic() + within_sec
+    while thread.is_alive():
+        if time.monotonic() > deadline:
+            pytest.fail(f"waited {within_sec} s for close thread to exit")
         await asyncio.sleep(0.01)
 
 
@@ -310,3 +389,82 @@ async def test_a_cancellation_during_open_exec_closes_the_stream_off_the_loop(
     assert stream.close_thread_id != cluster.open_thread_id
     assert stream.close_thread_name is not None
     assert not stream.close_thread_name.startswith(_DEFAULT_WORKER_PREFIX)
+
+
+async def test_a_cancellation_during_open_exec_that_raises_leaves_no_unhandled_exception(
+    tmp_path: Path,
+) -> None:
+    _use_one_default_worker()
+    stream = _SlowCloseStream()
+    cluster = _FailingOpenCluster(stream, RuntimeError("exec upgrade failed"))
+    environment = fake_environment(_Environment, tmp_path, cluster)
+    assert isinstance(environment, _Environment)
+    loop = asyncio.get_running_loop()
+    baseline = asyncio.all_tasks(loop)
+
+    with _capture_unhandled_exceptions() as unhandled:
+        run = asyncio.create_task(environment.run_command())
+        try:
+            await _until(cluster.opening, within_sec=_SLACK_SEC)
+            run.cancel()
+            done, _ = await asyncio.wait({run}, timeout=_SLACK_SEC)
+            assert run in done
+            with pytest.raises(asyncio.CancelledError):
+                await run
+
+            cluster.release_open.set()
+            await _until(cluster.open_returned, within_sec=_SLACK_SEC)
+            await _until_tasks_in(loop, baseline, within_sec=_SLACK_SEC)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            gc.collect()
+        finally:
+            cluster.release_open.set()
+            stream.end_command()
+
+    assert stream.closes == 0
+    assert unhandled == []
+
+
+async def test_a_cancellation_during_open_exec_whose_close_raises_leaves_no_unhandled_exception(
+    tmp_path: Path,
+) -> None:
+    _use_one_default_worker()
+    loop_thread_id = threading.get_ident()
+    stream = _FailingCloseStream(RuntimeError("close failed"))
+    cluster = _BlockedOpenCluster(stream)
+    environment = fake_environment(_Environment, tmp_path, cluster)
+    assert isinstance(environment, _Environment)
+    loop = asyncio.get_running_loop()
+    baseline = asyncio.all_tasks(loop)
+
+    with _capture_unhandled_exceptions() as unhandled:
+        run = asyncio.create_task(environment.run_command())
+        try:
+            await _until(cluster.opening, within_sec=_SLACK_SEC)
+            run.cancel()
+            done, _ = await asyncio.wait({run}, timeout=_SLACK_SEC)
+            assert run in done
+            with pytest.raises(asyncio.CancelledError):
+                await run
+
+            cluster.release_open.set()
+            await _until(cluster.open_returned, within_sec=_SLACK_SEC)
+            await _until(stream.closed, within_sec=_SLACK_SEC)
+            await _until_tasks_in(loop, baseline, within_sec=_SLACK_SEC)
+            assert stream.close_thread is not None
+            await _until_thread_exits(stream.close_thread, within_sec=_SLACK_SEC)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            gc.collect()
+        finally:
+            cluster.release_open.set()
+            stream.end_command()
+
+    assert stream.closes == 1
+    assert stream.close_thread_id is not None
+    assert stream.close_thread_id != loop_thread_id
+    assert stream.close_thread_id != cluster.open_thread_id
+    assert stream.close_thread_name is not None
+    assert not stream.close_thread_name.startswith(_DEFAULT_WORKER_PREFIX)
+    assert unhandled == []
