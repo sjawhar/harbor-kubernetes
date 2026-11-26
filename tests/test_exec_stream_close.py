@@ -468,3 +468,52 @@ async def test_a_cancellation_during_open_exec_whose_close_raises_leaves_no_unha
     assert stream.close_thread_name is not None
     assert not stream.close_thread_name.startswith(_DEFAULT_WORKER_PREFIX)
     assert unhandled == []
+
+
+def test_a_stream_that_open_exec_returns_after_the_loop_ends_is_closed(
+    tmp_path: Path,
+) -> None:
+    """A caller cancels ``_run`` while ``open_exec`` blocks, and then its loop ends.
+
+    ``asyncio.run`` cancels every task that is left when its coroutine returns, as a
+    shutdown that cancels all tasks does, and only then waits for the default executor's
+    workers. So ``open_exec`` returns its stream after the loop has stopped running
+    callbacks, and nothing on the loop can close that stream any more.
+    """
+    caller_thread_id = threading.get_ident()
+    stream = _SlowCloseStream()
+    cluster = _BlockedOpenCluster(stream)
+    environment = fake_environment(_Environment, tmp_path, cluster)
+    assert isinstance(environment, _Environment)
+    # Far longer than the loop takes to cancel its tasks once the coroutine returns.
+    release = threading.Timer(0.5, cluster.release_open.set)
+
+    async def cancel_while_open_exec_blocks() -> None:
+        _use_one_default_worker()
+        run = asyncio.create_task(environment.run_command())
+        await _until(cluster.opening, within_sec=_SLACK_SEC)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        assert not cluster.open_returned.is_set()
+        release.start()
+
+    try:
+        asyncio.run(cancel_while_open_exec_blocks())
+        assert cluster.open_returned.wait(_SLACK_SEC)
+        closed = stream.closed.wait(_CLOSE_SEC + _SLACK_SEC)
+    finally:
+        release.cancel()
+        cluster.release_open.set()
+        stream.end_command()
+
+    assert closed, (
+        "the stream that open_exec returned after the loop ended was left unclosed "
+        + f"(closes={stream.closes})"
+    )
+    assert stream.closes == 1
+    assert stream.close_thread_id is not None
+    assert stream.close_thread_id != caller_thread_id
+    assert stream.close_thread_id != cluster.open_thread_id
+    assert stream.close_thread_name is not None
+    assert not stream.close_thread_name.startswith(_DEFAULT_WORKER_PREFIX)
