@@ -9,7 +9,10 @@ advertised byte count rather than waiting for stdin EOF, and reject short input.
 receiver also reads the whole advertised byte count when one of its steps fails, so a
 failed upload fails at once rather than waiting on input that nobody reads.
 Directory archives are staged in a temporary file for length verification before
-extraction.
+extraction. Each exec stream closes on a dedicated thread, so a close that waits for the
+server does not hold the event loop. When a command is cancelled while its exec is still
+opening, the stream that opens later is closed the same way, even after the event loop
+has ended.
 
 The package has no dependency on a particular Harbor host. It works with a normal
 `harbor run` from a machine that has Kubernetes credentials, as well as from a service
