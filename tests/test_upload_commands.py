@@ -24,8 +24,9 @@ from harbor_kubernetes.transport import (
     pack_directory,
 )
 
-# 1.5 MiB, far more than the 64 KiB a Linux pipe holds, so bytes a command leaves unread
-# stay visible to the test rather than fitting in the pipe.
+# 1.5 MiB: more than one read buffer of GNU head and more than the 512 KiB file-size
+# limit of the directory write-failure case, so a failed write stops well before the
+# end of the input; and past the 1 MiB scale at which an exec input left open stalls.
 _PAYLOAD_BYTES = 3 * 512 * 1024
 # Each case ends in well under a second. Only a command that waits for more input,
 # which never comes, reaches this.
@@ -106,7 +107,8 @@ def _run_with_open_input(
             stdin=read_end,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            env={**os.environ, "TMPDIR": str(tmp_path)},
+            # The C locale makes coreutils and tar error messages match os.strerror.
+            env={**os.environ, "TMPDIR": str(tmp_path), "LC_ALL": "C"},
             errors="replace",
             start_new_session=True,
         ) as process:
@@ -115,7 +117,9 @@ def _run_with_open_input(
                 stderr: str = process.communicate(timeout=exit_within_sec)[1]
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.communicate()
+                # A child that outlives the kill holds stderr open: bound the wait so
+                # the test fails instead of hanging.
+                process.communicate(timeout=_EXIT_WITHIN_SEC)
                 pytest.fail(f"the command did not exit within {exit_within_sec} s")
             finally:
                 # The writer finishes before either end of its pipe closes.
