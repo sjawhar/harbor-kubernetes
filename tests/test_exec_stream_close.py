@@ -31,6 +31,8 @@ _CLIENT_TIMEOUT_SEC = 0.2
 _MIN_WAKES_DURING_CLOSE = 5
 # What a close on a thread of its own leaves for the rest of _run.
 _SLACK_SEC = 2.0
+# The name of the default executor's one worker, so a test can tell its thread apart.
+_DEFAULT_WORKER_PREFIX = "default-exec-test"
 
 type _Answer = Callable[[list[str]], tuple[int, bytes, bytes]]
 
@@ -50,6 +52,8 @@ class _SlowCloseStream(FakeExecStream):
         self.closing: threading.Event = threading.Event()
         self.closed: threading.Event = threading.Event()
         self.status_read_before_close_ended: bool = False
+        self.close_thread_id: int | None = None
+        self.close_thread_name: str | None = None
         self._lock: threading.Lock = threading.Lock()
 
     @override
@@ -72,6 +76,8 @@ class _SlowCloseStream(FakeExecStream):
     def close(self) -> None:
         with self._lock:
             self.closes += 1
+            self.close_thread_id = threading.get_ident()
+            self.close_thread_name = threading.current_thread().name
         self.close_started = time.monotonic()
         super().close()
         self.closing.set()
@@ -98,6 +104,28 @@ class _OneStreamCluster(FakeCluster):
         return self.stream
 
 
+class _BlockedOpenCluster(_OneStreamCluster):
+    """A cluster whose ``open_exec`` blocks until released, as a slow exec upgrade does."""
+
+    def __init__(self, stream: _SlowCloseStream) -> None:
+        super().__init__(stream)
+        self.opening: threading.Event = threading.Event()
+        self.release_open: threading.Event = threading.Event()
+        self.open_returned: threading.Event = threading.Event()
+        self.open_thread_id: int | None = None
+
+    @override
+    def open_exec(
+        self, pod: str, namespace: str, command: list[str], stdin: bool
+    ) -> FakeExecStream:
+        self.open_thread_id = threading.get_ident()
+        self.opening.set()
+        self.release_open.wait()
+        stream = super().open_exec(pod, namespace, command, stdin)
+        self.open_returned.set()
+        return stream
+
+
 class _Environment(KubernetesEnvironment):
     async def run_command(
         self, *, client_timeout_sec: float | None = None
@@ -114,12 +142,14 @@ def _environment(tmp_path: Path, stream: _SlowCloseStream) -> _Environment:
 
 
 def _use_one_default_worker() -> None:
-    """Give the running loop a default executor of one worker.
+    """Give the running loop a default executor of one worker, named by a set prefix.
 
     After a timeout or a cancellation, that worker still runs ``collect_output`` until the
     stream closes, so a close queued on the default executor would never start.
     """
-    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix=_DEFAULT_WORKER_PREFIX)
+    )
 
 
 async def _tick(wakes: list[float]) -> None:
@@ -231,3 +261,52 @@ async def test_a_command_that_exits_returns_its_status_and_output_after_one_clos
     assert await environment.run_command() == (3, b"out", b"err")
     assert stream.closes == 1
     assert not stream.status_read_before_close_ended
+
+
+async def test_a_cancellation_during_open_exec_closes_the_stream_off_the_loop(
+    tmp_path: Path,
+) -> None:
+    _use_one_default_worker()
+    loop_thread_id = threading.get_ident()
+    stream = _SlowCloseStream()
+    cluster = _BlockedOpenCluster(stream)
+    environment = fake_environment(_Environment, tmp_path, cluster)
+    assert isinstance(environment, _Environment)
+    run = asyncio.create_task(environment.run_command())
+
+    try:
+        await _until(cluster.opening, within_sec=_SLACK_SEC)
+        run.cancel()
+        done, _ = await asyncio.wait({run}, timeout=_SLACK_SEC)
+        assert run in done, (
+            "_run did not raise its cancellation while open_exec blocked"
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        assert not cluster.release_open.is_set()
+        assert not cluster.open_returned.is_set(), (
+            "_run raised its cancellation only after open_exec returned"
+        )
+
+        cluster.release_open.set()
+        await _until(cluster.open_returned, within_sec=_SLACK_SEC)
+        # The close's time fits in this wait; a stream nobody closes never sets closed.
+        deadline = time.monotonic() + _SLACK_SEC
+        while not stream.closed.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+    finally:
+        cluster.release_open.set()
+        stream.end_command()
+
+    assert stream.closes == 1, (
+        "the stream returned by open_exec after cancellation was left unclosed "
+        + f"(closes={stream.closes})"
+    )
+    assert stream.closed.is_set(), (
+        f"the stream close did not finish within {_SLACK_SEC} s"
+    )
+    assert stream.close_thread_id is not None
+    assert stream.close_thread_id != loop_thread_id
+    assert stream.close_thread_id != cluster.open_thread_id
+    assert stream.close_thread_name is not None
+    assert not stream.close_thread_name.startswith(_DEFAULT_WORKER_PREFIX)
