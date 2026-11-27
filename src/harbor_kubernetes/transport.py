@@ -21,12 +21,25 @@ _CHECK_UPLOAD_SIZE = (
     'printf "Upload truncated: expected %s bytes, received %s\\n" "$1" "$received" >&2; '
     "exit 1; fi"
 )
-UPLOAD_FILE_SCRIPT = (
+
+
+def _reading_every_advertised_byte(steps: str) -> str:
+    """Make an upload command read its whole advertised byte count, also on failure.
+
+    An exec keeps the command's input open until the command exits, so a command whose
+    step fails and stops reading never returns. The steps read from `head -c "$1"`, so
+    no step reads past the count. When a step fails, `cat` reads what is left of the
+    count, and the command exits with the step's status.
+    """
+    return f'head -c "$1" | {{ {steps}; s=$?; cat > /dev/null; exit "$s"; }}'
+
+
+UPLOAD_FILE_SCRIPT = _reading_every_advertised_byte(
     'umask 022 && mkdir -p "$(dirname "$2")" && upload=$2 && head -c "$1" > "$upload" && '
     + _CHECK_UPLOAD_SIZE
     + ' && chmod "$3" "$upload"'
 )
-UPLOAD_DIR_SCRIPT = (
+UPLOAD_DIR_SCRIPT = _reading_every_advertised_byte(
     'umask 022 && mkdir -p "$2" && upload=$(mktemp) && '
     + "trap 'rm -f \"$upload\"' EXIT && "
     + 'head -c "$1" > "$upload" && '

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -10,6 +11,7 @@ import os
 import re
 import shlex
 import tarfile
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -342,6 +344,114 @@ def egress_probe(target: str) -> str:
         + f'if timeout 4 bash -c "</dev/tcp/{target}/{DNS_PORT}" >/dev/null 2>&1; '
         + "then echo OPEN; else echo CLOSED; fi"
     )
+
+
+def _start_close_thread(
+    exec_stream: ExecStream,
+    on_end: Callable[[BaseException | None], None] | None = None,
+) -> None:
+    """Start ``exec_stream.close()`` on a daemon thread of its own.
+
+    ``WSClient.close`` waits up to 3 s for the server's close frame, which the server does
+    not send while the command still runs, so the close must not hold the event loop. It
+    does not run on the loop's default executor either: after a timeout or a cancellation,
+    workers there still run ``collect_output`` until their streams close, and when they
+    hold every worker a queued close does not start, and a cancellation of its await
+    withdraws it. Starting the thread needs no event loop.
+
+    The thread passes what ``close`` raised, or None, to *on_end*. Without *on_end*
+    nobody waits for the close, and the thread drops what it raised.
+    """
+
+    def close() -> None:
+        error: BaseException | None = None
+        try:
+            exec_stream.close()
+        except BaseException as caught:  # noqa: BLE001 - goes to on_end or is dropped
+            error = caught
+        if on_end is not None:
+            on_end(error)
+
+    threading.Thread(target=close, name="exec-stream-close", daemon=True).start()
+
+
+def _close_on_own_thread(exec_stream: ExecStream) -> asyncio.Future[None]:
+    """Start the close of *exec_stream* on a thread of its own; return a future of its end.
+
+    The thread starts before the caller awaits, so no cancellation stops it.
+    """
+    loop = asyncio.get_running_loop()
+    ended: asyncio.Future[None] = loop.create_future()
+
+    def settle(error: BaseException | None) -> None:
+        # A loop that has closed has nobody left waiting for the close.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(_settle_close, ended, error)
+
+    _start_close_thread(exec_stream, settle)
+    return ended
+
+
+def _settle_close(ended: asyncio.Future[None], error: BaseException | None) -> None:
+    if ended.done():
+        # A second cancellation stopped the wait; the close ended all the same.
+        return
+    if error is None:
+        ended.set_result(None)
+    else:
+        ended.set_exception(error)
+
+
+class _ExecStreamHandoff:
+    """Decides whether ``_run`` or the ``open_exec`` thread starts the stream's close.
+
+    A cancellation of ``_run`` does not stop ``open_exec`` on its worker thread, and the
+    event loop can end before ``open_exec`` returns. So the two sides share a lock: a
+    cancelled ``_run`` gives the stream up and starts the close of one already published,
+    and the worker starts the close of a stream that was given up. Either side only
+    starts the close on a dedicated thread; neither calls ``close`` itself or leaves the
+    close to the loop.
+    """
+
+    def __init__(self) -> None:
+        self._lock: threading.Lock = threading.Lock()
+        self._stream: ExecStream | None = None
+        self._abandoned: bool = False
+
+    def open(
+        self,
+        open_exec: ExecOpener,
+        pod: str,
+        namespace: str,
+        command: list[str],
+        stdin: bool,
+    ) -> ExecStream:
+        """Run ``open_exec``, then publish its stream or start its close.
+
+        The stream goes to ``_run``. If ``abandon`` gave it up first, this instead starts
+        its close on a dedicated thread and returns without waiting for the close.
+        """
+        exec_stream = open_exec(pod, namespace, command, stdin)
+        with self._lock:
+            abandoned = self._abandoned
+            if not abandoned:
+                self._stream = exec_stream
+        if abandoned:
+            _start_close_thread(exec_stream)
+        return exec_stream
+
+    def abandon(self) -> None:
+        """Give the stream up for a cancelled ``_run``.
+
+        If ``open`` already published the stream, this starts its close on a dedicated
+        thread, so ``_run`` raises its cancellation without waiting for the close.
+        """
+        with self._lock:
+            self._abandoned = True
+            exec_stream = self._stream
+            self._stream = None
+        if exec_stream is not None:
+            _start_close_thread(exec_stream)
 
 
 class KubernetesEnvironment(BaseEnvironment):
@@ -1032,10 +1142,19 @@ class KubernetesEnvironment(BaseEnvironment):
         client_timeout_sec: float | None = None,
     ) -> tuple[int, bytes, bytes]:
         apis = await self._apis()
+        handoff = _ExecStreamHandoff()
         try:
             exec_stream = await asyncio.to_thread(
-                apis.open_exec, self.pod_name, self.namespace, argv, stdin is not None
+                handoff.open,
+                apis.open_exec,
+                self.pod_name,
+                self.namespace,
+                argv,
+                stdin is not None,
             )
+        except asyncio.CancelledError:
+            handoff.abandon()
+            raise
         except k8s_client.ApiException as error:
             if error.status == 404:
                 raise KubernetesPodGoneError(
@@ -1051,7 +1170,7 @@ class KubernetesEnvironment(BaseEnvironment):
             else:
                 stdout, stderr = await asyncio.wait_for(collected, client_timeout_sec)
         finally:
-            exec_stream.close()
+            await _close_on_own_thread(exec_stream)
         return return_code(exec_stream), stdout, stderr
 
     def remote_command(
