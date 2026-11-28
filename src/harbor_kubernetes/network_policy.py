@@ -1,14 +1,23 @@
-"""Per-trial Cilium policy manifests for Kubernetes Harbor environments."""
+"""Per-trial network enforcement for Kubernetes Harbor environments.
+
+Two backends enforce a restricted network mode. The ``cilium`` backend writes one
+CiliumNetworkPolicy per trial. The ``label`` backend writes nothing: it puts
+``NO_NETWORK_LABEL`` on a no-network trial's pod, and a NetworkPolicy the cluster
+operator applied to the namespace denies that pod all traffic.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from ipaddress import ip_address, ip_network
-from typing import NotRequired, Required, TypedDict
+from typing import Literal, NotRequired, Required, TypedDict
 
 from harbor.models.task.config import NetworkMode, NetworkPolicy
 
 SESSION_LABEL = "harbor-kubernetes/session"
+NO_NETWORK_LABEL = "harbor-no-network"
+NO_NETWORK_LABEL_VALUE = "true"
+NetworkPolicyBackend = Literal["cilium", "label"]
 SESSION_ID_ANNOTATION = "harbor-kubernetes/session-id"
 CILIUM_POLICY_GROUP = "cilium.io"
 CILIUM_POLICY_VERSION = "v2"
@@ -133,12 +142,17 @@ class CiliumPolicyOwnerPatch(TypedDict):
 
 
 def validated_pod_labels(pod_labels: Mapping[str, str] | None) -> dict[str, str]:
-    """Copy caller labels while reserving the provider's pod identity label."""
+    """Copy caller labels while reserving the provider's own pod labels."""
     labels = dict(pod_labels or {})
     if SESSION_LABEL in labels:
         raise ValueError(
             f"pod_labels may not set {SESSION_LABEL!r}: the provider owns it, and the "
             + "trial's network policy selects the pod by it."
+        )
+    if NO_NETWORK_LABEL in labels:
+        raise ValueError(
+            f"pod_labels may not set {NO_NETWORK_LABEL!r}: the provider owns it, and "
+            + "the namespace's no-network NetworkPolicy selects the pod by it."
         )
     return labels
 

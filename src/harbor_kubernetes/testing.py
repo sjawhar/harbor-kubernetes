@@ -14,8 +14,11 @@ from kubernetes import client as k8s_client
 
 from harbor_kubernetes.environment import KubernetesApis, KubernetesEnvironment
 from harbor_kubernetes.network_policy import (
+    NO_NETWORK_LABEL,
+    NO_NETWORK_LABEL_VALUE,
     CiliumNetworkPolicyManifest,
     CiliumPolicyOwnerPatch,
+    NetworkPolicyBackend,
 )
 
 __all__ = [
@@ -121,7 +124,12 @@ def _not_found() -> k8s_client.ApiException:
 
 
 class FakeCluster:
-    """The pod, Cilium custom-resource, service, and exec surfaces a trial uses."""
+    """The pod, Cilium custom-resource, service, and exec surfaces a trial uses.
+
+    ``no_network_label_policy`` stands for a namespace NetworkPolicy that denies all
+    traffic to pods labelled ``harbor-no-network=true``: when set, the egress probe from
+    such a pod reads closed, as it does from a pod under a Cilium no-network policy.
+    """
 
     def __init__(
         self,
@@ -130,6 +138,7 @@ class FakeCluster:
         waiting_reason: str | None = None,
         cilium_create_error: k8s_client.ApiException | None = None,
         cilium_reports_status: bool = False,
+        no_network_label_policy: bool = True,
     ) -> None:
         self.pods: dict[str, k8s_client.V1Pod] = {}
         self.policies: dict[str, CiliumNetworkPolicyManifest] = {}
@@ -145,6 +154,7 @@ class FakeCluster:
         self.cilium_enabled: bool = True
         self.cilium_create_error: k8s_client.ApiException | None = cilium_create_error
         self.service_dns_ip: str | None = "10.96.0.10"
+        self.no_network_label_policy: bool = no_network_label_policy
 
     def create_namespaced_pod(
         self, namespace: str, body: k8s_client.V1Pod
@@ -333,16 +343,20 @@ class FakeCluster:
         self.calls.append(("delete_policy", name))
         return None
 
-    def _denies_egress(self) -> bool:
+    def _denies_egress(self, pod: str) -> bool:
+        if self.no_network_label_policy:
+            metadata = self.pods[pod].metadata
+            labels = {} if metadata is None else metadata.labels or {}
+            if labels.get(NO_NETWORK_LABEL) == NO_NETWORK_LABEL_VALUE:
+                return True
         return any(
             policy["spec"].get("egressDeny") == [{"toEntities": ["all"]}]
             for policy in self.policies.values()
         )
 
-    def _answer_probe(self, argv: list[str]) -> tuple[int, bytes, bytes]:
-        del argv
+    def _answer_probe(self, pod: str) -> tuple[int, bytes, bytes]:
         self.probes += 1
-        closed = self._denies_egress() and self.probes > self.egress_closes_after
+        closed = self._denies_egress(pod) and self.probes > self.egress_closes_after
         return 0, (b"CLOSED\n" if closed else b"OPEN\n"), b""
 
     def open_exec(
@@ -351,8 +365,9 @@ class FakeCluster:
         del namespace, stdin
         if pod not in self.pods:
             raise _not_found()
-        probe = "/dev/tcp/" in command[-1]
-        return FakeExecStream(command, self._answer_probe if probe else None)
+        if "/dev/tcp/" not in command[-1]:
+            return FakeExecStream(command, None)
+        return FakeExecStream(command, lambda _argv: self._answer_probe(pod))
 
 
 def network_policy(mode: NetworkMode) -> NetworkPolicy:
@@ -377,6 +392,7 @@ def fake_environment(
     ephemeral_storage_limit: str | None = None,
     allow_public_network: bool = True,
     cluster_dns_ip: str | None = None,
+    network_policy_backend: NetworkPolicyBackend = "cilium",
 ) -> KubernetesEnvironment:
     """Build *environment_class* against *cluster* with fast polling for tests."""
     environment_dir = tmp_path / "task" / "environment"
@@ -403,6 +419,7 @@ def fake_environment(
         ephemeral_storage_limit=ephemeral_storage_limit,
         allow_public_network=allow_public_network,
         cluster_dns_ip=cluster_dns_ip,
+        network_policy_backend=network_policy_backend,
         apis=KubernetesApis(cluster, cluster, cluster.open_exec),
     )
     environment.POLL_INTERVAL_SEC = 0.0
